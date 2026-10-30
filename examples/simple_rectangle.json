@@ -1,0 +1,17 @@
+{
+  "version": "1.0",
+  "units": "mm",
+  "features": [
+    {
+      "id": "S1", "type": "sketch",
+      "plane": {"origin": [0, 0, 0], "normal": [1, 0, 0], "x_dir": [0, 1, 0]},
+      "profiles": [{"outer": [
+        {"type": "line", "start": [-61.0509, -44.4132], "end": [61.0509, -44.4132]},
+        {"type": "line", "start": [61.0509, -44.4132], "end": [61.0509, 44.4132]},
+        {"type": "line", "start": [61.0509, 44.4132], "end": [-61.0509, 44.4132]},
+        {"type": "line", "start": [-61.0509, 44.4132], "end": [-61.0509, -44.4132]}
+      ]}]
+    },
+    {"id": "P1", "type": "pad", "sketch": "S1", "length": 20, "direction": 1}
+  ]
+}

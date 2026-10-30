@@ -1,0 +1,48 @@
+{
+  "version": "1.0",
+  "units": "mm",
+  "features": [
+    {
+      "id": "S1", "type": "sketch",
+      "plane": {"origin": [0, 60, 0], "normal": [0, -1, 0], "x_dir": [1, 0, 0]},
+      "profiles": [{"outer": [
+        {"type": "line", "start": [0, 0], "end": [100, 0]},
+        {"type": "line", "start": [100, 0], "end": [100, 10]},
+        {"type": "line", "start": [100, 10], "end": [10, 10]},
+        {"type": "line", "start": [10, 10], "end": [10, 70]},
+        {"type": "arc", "start": [10, 70], "mid": [5, 75], "end": [0, 70]},
+        {"type": "line", "start": [0, 70], "end": [0, 0]}
+      ]}]
+    },
+    {"id": "P1", "type": "pad", "sketch": "S1", "length": 60, "direction": 1},
+    {
+      "id": "S2", "type": "sketch",
+      "plane": {"origin": [0, 0, 10], "normal": [0, 0, 1], "x_dir": [1, 0, 0]},
+      "profiles": [{"outer": [
+        {"type": "line", "start": [55, 24], "end": [85, 24]},
+        {"type": "arc", "start": [85, 24], "mid": [91, 30], "end": [85, 36]},
+        {"type": "line", "start": [85, 36], "end": [55, 36]},
+        {"type": "arc", "start": [55, 36], "mid": [49, 30], "end": [55, 24]}
+      ]}]
+    },
+    {"id": "K1", "type": "pocket", "sketch": "S2", "through_all": true, "direction": -1},
+    {"id": "H1", "type": "hole", "kind": "counterbore", "position": [0, 15, 45], "direction": [1, 0, 0],
+     "diameter": 6.6, "through_all": true, "cb_diameter": 11, "cb_depth": 4},
+    {"id": "H2", "type": "hole", "kind": "counterbore", "position": [0, 45, 45], "direction": [1, 0, 0],
+     "diameter": 6.6, "through_all": true, "cb_diameter": 11, "cb_depth": 4},
+    {"id": "H3", "type": "hole", "kind": "countersink", "position": [25, 15, 10], "direction": [0, 0, -1],
+     "diameter": 5.5, "through_all": true, "cs_diameter": 10, "cs_angle": 90},
+    {"id": "H4", "type": "hole", "kind": "countersink", "position": [25, 45, 10], "direction": [0, 0, -1],
+     "diameter": 5.5, "through_all": true, "cs_diameter": 10, "cs_angle": 90},
+    {"id": "F1", "type": "fillet", "radius": 5, "edges": [
+      {"point": [10, 30, 10], "curve": "line"}
+    ]},
+    {"id": "F2", "type": "fillet", "radius": 8, "edges": [
+      {"point": [100, 0, 5], "curve": "line"},
+      {"point": [100, 60, 5], "curve": "line"}
+    ]},
+    {"id": "C1", "type": "chamfer", "distance": 1, "edges": [
+      {"point": [50, 0, 0], "curve": "line"}
+    ]}
+  ]
+}

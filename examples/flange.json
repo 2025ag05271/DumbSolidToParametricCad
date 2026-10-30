@@ -1,0 +1,37 @@
+{
+  "version": "1.0",
+  "units": "mm",
+  "features": [
+    {
+      "id": "S1", "type": "sketch",
+      "plane": {"origin": [0, 0, 0], "normal": [0, 0, 1], "x_dir": [1, 0, 0]},
+      "profiles": [{"outer": [{"type": "circle", "center": [0, 0], "radius": 50}]}]
+    },
+    {"id": "P1", "type": "pad", "sketch": "S1", "length": 12, "direction": 1},
+    {
+      "id": "S2", "type": "sketch",
+      "plane": {"origin": [0, 0, 12], "normal": [0, 0, 1], "x_dir": [1, 0, 0]},
+      "profiles": [{"outer": [{"type": "circle", "center": [0, 0], "radius": 22}]}]
+    },
+    {"id": "P2", "type": "pad", "sketch": "S2", "length": 30, "direction": 1},
+    {
+      "id": "S3", "type": "sketch",
+      "plane": {"origin": [0, 0, 42], "normal": [0, 0, 1], "x_dir": [1, 0, 0]},
+      "profiles": [{"outer": [{"type": "circle", "center": [0, 0], "radius": 12}]}]
+    },
+    {"id": "K1", "type": "pocket", "sketch": "S3", "through_all": true, "direction": -1},
+    {"id": "H1", "type": "hole", "position": [36, 0, 12], "direction": [0, 0, -1], "diameter": 9, "through_all": true},
+    {"id": "H2", "type": "hole", "position": [18, 31.1769, 12], "direction": [0, 0, -1], "diameter": 9, "through_all": true},
+    {"id": "H3", "type": "hole", "position": [-18, 31.1769, 12], "direction": [0, 0, -1], "diameter": 9, "through_all": true},
+    {"id": "H4", "type": "hole", "position": [-36, 0, 12], "direction": [0, 0, -1], "diameter": 9, "through_all": true},
+    {"id": "H5", "type": "hole", "position": [-18, -31.1769, 12], "direction": [0, 0, -1], "diameter": 9, "through_all": true},
+    {"id": "H6", "type": "hole", "position": [18, -31.1769, 12], "direction": [0, 0, -1], "diameter": 9, "through_all": true},
+    {"id": "F1", "type": "fillet", "radius": 3, "edges": [
+      {"point": [22, 0, 12], "curve": "circle"}
+    ]},
+    {"id": "C1", "type": "chamfer", "distance": 1.5, "edges": [
+      {"point": [22, 0, 42], "curve": "circle"}
+    ]},
+    {"id": "M1", "type": "mirror", "plane": {"origin": [0, 0, 0], "normal": [0, 0, 1]}}
+  ]
+}

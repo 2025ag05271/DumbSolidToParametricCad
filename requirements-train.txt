@@ -1,0 +1,12 @@
+# Training / evaluation / prediction environment (.venv) — torch with CUDA 12.8 (needed for Blackwell GPUs).
+# Install torch first from the PyTorch index:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# then:
+#   pip install -r requirements-train.txt
+torch>=2.7
+numpy
+scipy
+pydantic>=2
+cadquery==2.8.0
+matplotlib
+networkx

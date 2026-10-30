@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+myenv/
+
+# Generated datasets (GBs) — regenerate with `python -m datagen.run` + `python -m cadseq.prepare`
+data/
+
+# Training runs: checkpoints are 140–420 MB (over GitHub's 100 MB limit) — regenerate with `python -m s2pnet.train`
+runs/
+
+# Misc outputs
+*.log
+out/
+preview.png
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

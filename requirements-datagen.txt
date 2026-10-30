@@ -1,0 +1,20 @@
+# Dataset-generation / notebook environment (DGL 2.2 needs torch 2.3 and numpy 1.x).
+# torch + dgl (CUDA 12.1 wheels):
+#   pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu121
+#   pip install dgl==2.2.1 -f https://data.dgl.ai/wheels/torch-2.3/cu121/repo.html
+# cadquery must be installed WITHOUT its dependencies (it would upgrade numpy to 2.x):
+#   pip install cadquery==2.8.0 --no-deps
+# then:
+#   pip install -r requirements-datagen.txt
+numpy==1.26.4
+scipy
+pydantic>=2
+cadquery-ocp==7.9.3.1.1
+ezdxf>=1.3.0
+multimethod>=1.11,<2.0
+runtype
+casadi
+numba<0.61
+nlopt==2.7.1
+matplotlib
+networkx
