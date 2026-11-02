@@ -27,15 +27,35 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 import torch
 
-from cadseq.dataset import CADGraphSeqDataset, collate, to_device
+from cadseq.dataset import CADGraphSeqDataset, CopySeqDataset, collate, collate_copy, to_device
+from cadseq.pose import transform_sequence
 from cadseq.prepare import load_index, sample_path
 from cadseq.workers import SupervisedPool
 
 from .model import Solid2Param
 from .train import keep_awake
 from .verify import cad_check, decode_candidates, generate_candidates
+
+
+def unpose(keep, seqs, pose):
+    """Map histories predicted for a posed input (x -> R x + t) back to the original frame.
+    Returns (kept candidate indices, mapped sequences); candidates that leave the range are dropped."""
+    R, t = pose
+    if np.allclose(R, np.eye(3)) and not np.any(t):
+        return keep, seqs
+    Ri = R.T
+    ti = -(Ri @ t)
+    k_out, s_out = [], []
+    for k, s in zip(keep, seqs):
+        try:
+            s_out.append(transform_sequence(s, Ri, ti))
+            k_out.append(k)
+        except Exception:
+            pass
+    return k_out, s_out
 
 
 def main() -> None:
@@ -51,6 +71,9 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--timeout", type=float, default=60.0, help="seconds per candidate")
+    ap.add_argument("--pose", action="store_true",
+                    help="copy models: give each part a fixed random axis-aligned pose + translation; "
+                         "predictions are mapped back before comparing with the original STEP")
     ap.add_argument("--tag", default=None, help="output file suffix (default: s<samples>[_t<temp>])")
     args = ap.parse_args()
 
@@ -58,23 +81,32 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     model = Solid2Param.from_checkpoint(ckpt["model"]).to(device).eval()
-    ds = CADGraphSeqDataset(args.data, args.split, limit=args.n)
+    if model.cfg.copy:
+        ds = CopySeqDataset(args.data, args.split, limit=args.n, pose_aug=1.0 if args.pose else 0.0, fixed_pose=True)
+        coll = collate_copy
+    else:
+        if args.pose:
+            raise SystemExit("--pose needs a copy model (v1 models were trained in the generated placement)")
+        ds, coll = CADGraphSeqDataset(args.data, args.split, limit=args.n), collate
     index = load_index(args.data)
-    tag = args.tag or (f"s{args.samples}" + (f"_t{args.temperature:g}" if args.samples > 1 else ""))
+    tag = args.tag or (f"s{args.samples}" + (f"_t{args.temperature:g}" if args.samples > 1 else "")
+                       + ("_posed" if args.pose else ""))
 
     t0 = time.time()
     preds = []
     for s in range(0, len(ds), args.bs):
-        batch = to_device(collate([ds[i] for i in range(s, min(len(ds), s + args.bs))]), device)
+        batch = to_device(coll([ds[i] for i in range(s, min(len(ds), s + args.bs))]), device)
         cands = generate_candidates(model, batch, args.samples, args.temperature, seed=args.seed + s)
-        for sid, cs, gt, L in zip(batch["ids"], cands, batch["tokens"].tolist(), batch["lengths"].tolist()):
-            preds.append((sid, cs, gt[:L]))
+        poses = batch.get("poses") or [(np.eye(3), np.zeros(3))] * len(cands)
+        for sid, cs, gt, L, pose in zip(batch["ids"], cands, batch["tokens"].tolist(), batch["lengths"].tolist(), poses):
+            preds.append((sid, cs, gt[:L], pose))
         print(f"  generated {len(preds)}/{len(ds)}", flush=True)
     gen_s = time.time() - t0
 
     rows, jobs = [], []
-    for sid, cands, gt in preds:
+    for sid, cands, gt, pose in preds:
         keep, seqs = decode_candidates(cands)
+        keep, seqs = unpose(keep, seqs, pose)
         r = {"id": sid, "family": index[sid]["family"], "exact": False, "n_gt_tokens": len(gt),
              "n_unique": len(cands), "valid": bool(seqs), "built_strict": False, "built": False,
              "iou": 0.0, "iou_strict": 0.0, "skipped": 0, "chosen": None}

@@ -30,9 +30,16 @@ from cadseq.dataset import CADGraphSeqDataset, LengthBucketSampler, collate, to_
 from cadseq.prepare import sample_path
 from cadseq.tokenizer import EOS_ID, DecodeError, decode
 from cadseq.workers import SupervisedPool
+from cadseq.dataset import CopySeqDataset, collate_copy
 
 from .model import ModelConfig, Solid2Param
 from .verify import cad_check
+
+
+def _reseed_worker(worker_id: int) -> None:
+    """Distinct pose-augmentation random streams per DataLoader worker."""
+    info = torch.utils.data.get_worker_info()
+    info.dataset.rng = np.random.default_rng(torch.initial_seed() % 2**32)
 
 
 def keep_awake() -> None:
@@ -55,6 +62,16 @@ def lr_at(step, total, warmup, peak, floor=0.05):
 @torch.no_grad()
 def validate(model, loader, device, amp_dtype):
     model.eval()
+    if model.cfg.copy:  # mixture (copy / generate) likelihood: average the training loss + metrics
+        tot, n, agg = 0.0, 0, {}
+        for batch in loader:
+            batch = to_device(batch, device)
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
+                loss, m = model.loss(batch)
+            tot, n = tot + loss.item(), n + 1
+            for k, v in m.items():
+                agg[k] = agg.get(k, 0.0) + v
+        return {"val_loss": tot / n, **{f"val_{k}": v / n for k, v in agg.items()}}
     tot, n_tok, correct, seq_ok, n_seq = 0.0, 0, 0, 0, 0
     for batch in loader:
         batch = to_device(batch, device)
@@ -87,7 +104,7 @@ def token_edit_distance(a, b) -> int:
 
 
 @torch.no_grad()
-def generation_eval(model, ds, device, amp_dtype, n: int, batch_size: int = 32):
+def generation_eval(model, ds, device, amp_dtype, n: int, batch_size: int = 32, coll=collate):
     """Grammar-constrained greedy decoding on the first n samples (no CAD kernel needed).
 
     Returns (metrics, predicted token sequences). ``gen_tok_err`` is the token edit distance
@@ -98,11 +115,15 @@ def generation_eval(model, ds, device, amp_dtype, n: int, batch_size: int = 32):
     n = min(n, len(ds))
     exact = valid = feat_ok = 0
     errs, seqs = [], []
+    copied = numbers = 0
     t0 = time.time()
     for s in range(0, n, batch_size):
-        batch = to_device(collate([ds[i] for i in range(s, min(n, s + batch_size))]), device)
+        batch = to_device(coll([ds[i] for i in range(s, min(n, s + batch_size))]), device)
         with torch.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
             outs = model.generate(batch, max_len=model.cfg.max_len)
+        st = getattr(model.decoder, "copy_stats", None)
+        if st:
+            copied, numbers = copied + st["copied"], numbers + st["numbers"]
         for seq, gt, L in zip(outs, batch["tokens"].tolist(), batch["lengths"].tolist()):
             gt = gt[:L]
             seqs.append(seq)
@@ -118,6 +139,8 @@ def generation_eval(model, ds, device, amp_dtype, n: int, batch_size: int = 32):
     metrics = {"gen_n": n, "gen_exact": exact / n, "gen_valid": valid / n,
                "gen_feature_types_match": feat_ok / n, "gen_tok_err": float(np.mean(errs)),
                "gen_seconds": round(time.time() - t0, 1)}
+    if numbers:
+        metrics["gen_copy_rate"] = copied / numbers
     return metrics, seqs
 
 
@@ -170,7 +193,13 @@ def main() -> None:
     ap.add_argument("--val-split", default="val", help="split used for validation (e.g. 'train' to check overfitting)")
     ap.add_argument("--seed", type=int, default=0)
     for f, v in asdict(ModelConfig()).items():
-        ap.add_argument(f"--{f.replace('_', '-')}", type=type(v), default=None)
+        if isinstance(v, bool):
+            ap.add_argument(f"--{f.replace('_', '-')}", action="store_true", default=None)
+        else:
+            ap.add_argument(f"--{f.replace('_', '-')}", type=type(v), default=None)
+    ap.add_argument("--pose-aug", type=float, default=0.0,
+                    help="v2: probability of a random axis-aligned pose + translation per training item")
+    ap.add_argument("--loader-workers", type=int, default=0)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -181,14 +210,6 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     args.out.mkdir(parents=True, exist_ok=True)
 
-    train_ds = CADGraphSeqDataset(args.data, "train", max_len=args.max_seq, limit=args.limit)
-    val_ds = CADGraphSeqDataset(args.data, args.val_split, max_len=args.max_seq,
-                                limit=args.limit if args.val_split == "train" else None)
-    sampler = LengthBucketSampler(train_ds, args.bs, shuffle=True, seed=args.seed)
-    train_dl = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate, pin_memory=True)
-    val_dl = DataLoader(val_ds, batch_sampler=LengthBucketSampler(val_ds, args.bs * 2, shuffle=False),
-                        collate_fn=collate, pin_memory=True)
-
     ckpt_path = args.out / "last.pt"
     resume = torch.load(ckpt_path, map_location="cpu", weights_only=False) if ckpt_path.exists() else None
     if resume:
@@ -196,6 +217,29 @@ def main() -> None:
     else:
         cfg = ModelConfig(**{f: (getattr(args, f) if getattr(args, f) is not None else v)
                              for f, v in asdict(ModelConfig()).items()})
+
+    if cfg.copy:
+        train_ds = CopySeqDataset(args.data, "train", pose_aug=args.pose_aug, max_len=args.max_seq,
+                                  limit=args.limit, seed=args.seed)
+        val_ds = CopySeqDataset(args.data, args.val_split, max_len=args.max_seq,
+                                limit=args.limit if args.val_split == "train" else None)
+        coll = collate_copy
+    else:
+        train_ds = CADGraphSeqDataset(args.data, "train", max_len=args.max_seq, limit=args.limit)
+        val_ds = CADGraphSeqDataset(args.data, args.val_split, max_len=args.max_seq,
+                                    limit=args.limit if args.val_split == "train" else None)
+        coll = collate
+    sampler = LengthBucketSampler(train_ds, args.bs, shuffle=True, seed=args.seed)
+    loader_kw = {}
+    if args.loader_workers > 0:
+        loader_kw = {"num_workers": args.loader_workers, "persistent_workers": True,
+                     "worker_init_fn": _reseed_worker}
+    train_dl = DataLoader(train_ds, batch_sampler=sampler, collate_fn=coll, pin_memory=True, **loader_kw)
+    # Copy scoring over thousands of candidates makes eval as memory-hungry as training: don't double the batch.
+    val_bs = args.bs if cfg.copy else args.bs * 2
+    val_dl = DataLoader(val_ds, batch_sampler=LengthBucketSampler(val_ds, val_bs, shuffle=False),
+                        collate_fn=coll, pin_memory=True)
+
     model = Solid2Param(cfg).to(device)
     decay = [p for n, p in model.named_parameters() if p.dim() >= 2 and "pos" not in n and "tok" not in n]
     no_decay = [p for n, p in model.named_parameters() if not (p.dim() >= 2 and "pos" not in n and "tok" not in n)]
@@ -226,7 +270,8 @@ def main() -> None:
     log = open(args.out / "log.jsonl", "a", encoding="utf-8")
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        t0, run_loss, run_acc, nb, ntok = time.time(), 0.0, 0.0, 0, 0
+        t0, run_loss, nb, ntok = time.time(), 0.0, 0, 0
+        run_m: dict = {}
         for batch in train_dl:
             batch = to_device(batch, device)
             for g in opt.param_groups:
@@ -241,18 +286,21 @@ def main() -> None:
             nb += 1
             ntok += int(batch["lengths"].sum())
             run_loss += loss.item()
-            run_acc += m["tok_acc"]
+            for k, v in m.items():
+                run_m[k] = run_m.get(k, 0.0) + v
             if step % 100 == 0:
-                print(f"  ep {epoch} step {step} loss {run_loss / nb:.4f} tok_acc {run_acc / nb:.4f} "
+                extra = " ".join(f"{k} {v / nb:.4f}" for k, v in run_m.items() if k != "seq_acc")
+                print(f"  ep {epoch} step {step} loss {run_loss / nb:.4f} {extra} "
                       f"gnorm {gnorm:.2f} lr {opt.param_groups[0]['lr']:.2e} "
                       f"{ntok / (time.time() - t0):.0f} tok/s", flush=True)
 
-        rec = {"epoch": epoch, "step": step, "train_loss": run_loss / nb, "train_tok_acc": run_acc / nb,
+        rec = {"epoch": epoch, "step": step, "train_loss": run_loss / nb,
+               **{f"train_{k}": v / nb for k, v in run_m.items()},
                "epoch_seconds": round(time.time() - t0, 1)}
         rec.update(validate(model, val_dl, device, amp_dtype))
         score = None if use_cad else -rec["val_loss"]
         if (epoch + 1) % args.gen_every == 0 or epoch + 1 == args.epochs:
-            gen_metrics, seqs = generation_eval(model, val_ds, device, amp_dtype, args.gen_samples)
+            gen_metrics, seqs = generation_eval(model, val_ds, device, amp_dtype, args.gen_samples, coll=coll)
             rec.update(gen_metrics)
             if use_cad:
                 rec.update(cad_eval(seqs[:cad_n], cad_paths))

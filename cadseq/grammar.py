@@ -15,6 +15,8 @@ dataset's canonical stage order: pads → pockets → holes → fillets → cham
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 from .tokenizer import (
     AXES,
     BOS_ID,
@@ -52,15 +54,40 @@ class GrammarError(ValueError):
     pass
 
 
-def _number(positive: bool):
-    c = yield (POS_COARSE if positive else COARSE)
-    if positive and c == COARSE_BASE + _ZERO_COARSE:
-        yield POS_FINE_AT_ZERO
-    else:
-        yield FINE
+ANY = (-NUM_OFFSET, NUM_OFFSET - 1)  # quantized number range (inclusive)
+POS = (1, NUM_OFFSET - 1)
 
 
-def _program(canonical_order: bool):
+@lru_cache(maxsize=None)
+def _coarse_set(lo: int, hi: int) -> frozenset:
+    k0, k1 = (lo + NUM_OFFSET) // NUM_FINE, (hi + NUM_OFFSET) // NUM_FINE
+    return frozenset(range(COARSE_BASE + k0, COARSE_BASE + k1 + 1))
+
+
+@lru_cache(maxsize=None)
+def _fine_set(k: int, lo: int, hi: int) -> frozenset:
+    base = k * NUM_FINE - NUM_OFFSET
+    f0, f1 = max(0, lo - base), min(NUM_FINE - 1, hi - base)
+    return frozenset(range(FINE_BASE + f0, FINE_BASE + f1 + 1))
+
+
+def _number(state: dict, lo: int, hi: int, extra: frozenset = frozenset()):
+    """Yield the allowed sets of one number with quantized value in [lo, hi]; return its value
+    (None if a token of ``extra``, e.g. THROUGH, was chosen instead). While the number is about to
+    start, ``state["range"]`` exposes (lo, hi) to the copy head."""
+    if hi < lo:  # impossible bound (degenerate earlier value): do not dead-end the sequence
+        lo, hi = ANY
+    state["range"] = (lo, hi)
+    c = yield _coarse_set(lo, hi) | extra
+    state["range"] = None
+    if c in extra:
+        return None
+    k = c - COARSE_BASE
+    f = yield _fine_set(k, lo, hi)
+    return k * NUM_FINE + (f - FINE_BASE) - NUM_OFFSET
+
+
+def _program(canonical_order: bool, state: dict):
     yield frozenset({BOS_ID})
     stage, has_body, mirrored = 0, False, False
     tok = None
@@ -82,7 +109,7 @@ def _program(canonical_order: bool):
 
         if tok == T["SKETCH"]:
             yield AXIS6
-            yield from _number(False)
+            yield from _number(state, *ANY)
             yield frozenset({T["PROFILE"]})
             # profiles → loops → curves; exits on PAD / POCKET
             ops = set()
@@ -99,16 +126,16 @@ def _program(canonical_order: bool):
                 n = 0
                 while True:
                     if c == T["CIRCLE"]:
-                        yield from _number(False)
-                        yield from _number(False)
-                        yield from _number(True)
+                        yield from _number(state, *ANY)
+                        yield from _number(state, *ANY)
+                        yield from _number(state, *POS)
                         nxt = yield frozenset({T["LOOP"], T["PROFILE"]}) | ops
                         break
-                    yield from _number(False)
-                    yield from _number(False)
+                    yield from _number(state, *ANY)
+                    yield from _number(state, *ANY)
                     if c == T["ARC"]:
-                        yield from _number(False)
-                        yield from _number(False)
+                        yield from _number(state, *ANY)
+                        yield from _number(state, *ANY)
                     n += 1
                     allowed = set(CURVE_NEXT)
                     if n >= 2:
@@ -126,39 +153,37 @@ def _program(canonical_order: bool):
                 break
             if op == T["PAD"]:
                 yield frozenset({T["EXT+"], T["EXT-"], T["EXT_SYM"]})
-                yield from _number(True)
+                yield from _number(state, *POS)
                 has_body = True
                 stage = max(stage, 0)
             else:
                 yield frozenset({T["EXT+"], T["EXT-"]})
-                t = yield frozenset({T["THROUGH"]}) | POS_COARSE
-                if t != T["THROUGH"]:
-                    yield POS_FINE_AT_ZERO if t == COARSE_BASE + _ZERO_COARSE else FINE
+                yield from _number(state, *POS, extra=frozenset({T["THROUGH"]}))
                 stage = max(stage, 1)
             tok = None
 
         elif tok == T["HOLE"]:
             kind = yield HOLE_TOKS
+            head = None
             if kind in (T["H_CBORE"], T["H_CSINK"]):
-                yield from _number(True)
-                yield from _number(True)
+                head = yield from _number(state, *POS)  # counterbore / countersink diameter
+                yield from _number(state, *POS)
             yield AXIS6
             for _ in range(3):
-                yield from _number(False)
-            yield from _number(True)
-            t = yield frozenset({T["THROUGH"]}) | POS_COARSE
-            if t != T["THROUGH"]:
-                yield POS_FINE_AT_ZERO if t == COARSE_BASE + _ZERO_COARSE else FINE
+                yield from _number(state, *ANY)
+            # hole diameter must be smaller than the head diameter (schema rule)
+            yield from _number(state, 1, head - 1 if head is not None else POS[1])
+            yield from _number(state, *POS, extra=frozenset({T["THROUGH"]}))
             stage = max(stage, 2)
             tok = None
 
         elif tok in (T["FILLET"], T["CHAMFER"]):
-            yield from _number(True)
+            yield from _number(state, *POS)
             yield EDGE_TOKS
             stage = max(stage, _STAGE["FILLET" if tok == T["FILLET"] else "CHAMFER"])
             while True:
                 for _ in range(3):
-                    yield from _number(False)
+                    yield from _number(state, *ANY)
                 # another edge, or the start of the next feature
                 starts = set(EDGE_TOKS)
                 if not canonical_order or stage <= 1:
@@ -174,7 +199,7 @@ def _program(canonical_order: bool):
 
         elif tok == T["MIRROR"]:
             yield AXIS_POS
-            yield from _number(False)
+            yield from _number(state, *ANY)
             mirrored = True
             stage = 5
             tok = None
@@ -184,9 +209,15 @@ def _program(canonical_order: bool):
 
 class Grammar:
     def __init__(self, canonical_order: bool = True):
-        self._gen = _program(canonical_order)
+        self.state: dict = {"range": None}
+        self._gen = _program(canonical_order, self.state)
         self.allowed: frozenset = next(self._gen)
         self.done = False
+
+    @property
+    def number_range(self):
+        """(lo, hi) quantized value bounds if a number may start next, else None."""
+        return self.state["range"]
 
     def feed(self, tok: int) -> None:
         if self.done:

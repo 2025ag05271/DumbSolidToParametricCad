@@ -28,11 +28,12 @@ def generate_candidates(model, batch, samples: int = 1, temperature: float = 0.8
     device = batch["tokens"].device
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp and device.type == "cuda"):
         mem, pad = model.encode(batch)
-        out = [[seq] for seq in model.decoder.generate(mem, pad)]
+        copy = model.copy_context(batch, mem, pad) if hasattr(model, "copy_context") else None
+        out = [[seq] for seq in model.decoder.generate(mem, pad, copy=copy)]
         gen = torch.Generator(device=device)
         for k in range(1, samples):
             gen.manual_seed(seed * 1000 + k)
-            for i, seq in enumerate(model.decoder.generate(mem, pad, temperature=temperature, generator=gen)):
+            for i, seq in enumerate(model.decoder.generate(mem, pad, temperature=temperature, generator=gen, copy=copy)):
                 if seq not in out[i]:
                     out[i].append(seq)
     return out

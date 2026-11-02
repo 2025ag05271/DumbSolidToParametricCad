@@ -71,13 +71,9 @@ class CADGraphSeqDataset(Dataset):
         self.tokens, self.offsets = z["tokens"], z["offsets"]
         pos = {str(sid): i for i, sid in enumerate(z["ids"])}
         g = self.root / "graphs"
-        self.node_x = np.load(g / "node_x.npy", mmap_mode="r")
-        self.edge_x = np.load(g / "edge_x.npy", mmap_mode="r")
-        self.edge_index = np.load(g / "edge_index.npy", mmap_mode="r")
         self.node_off = np.load(g / "node_off.npy")
         self.edge_off = np.load(g / "edge_off.npy")
-        self.extra = {k: np.load(g / f"{k}.npy", mmap_mode="r")
-                      for k in LABEL_KEYS + ["face_attr", "edge_attr"] if (g / f"{k}.npy").exists()}
+        self._open()
 
         split_ids = json.loads((self.root / "splits.json").read_text(encoding="utf-8"))[split]
         self.items = [(sid, pos[sid]) for sid in split_ids]
@@ -85,6 +81,24 @@ class CADGraphSeqDataset(Dataset):
             self.items = [(s, k) for s, k in self.items if self.offsets[k + 1] - self.offsets[k] <= max_len]
         if limit is not None:
             self.items = self.items[:limit]
+
+    _MMAPS = ("node_x", "edge_x", "edge_index", "extra")
+
+    def _open(self) -> None:
+        """(Re)open the memory-mapped arrays (also called in DataLoader worker processes)."""
+        g = self.root / "graphs"
+        self.node_x = np.load(g / "node_x.npy", mmap_mode="r")
+        self.edge_x = np.load(g / "edge_x.npy", mmap_mode="r")
+        self.edge_index = np.load(g / "edge_index.npy", mmap_mode="r")
+        self.extra = {k: np.load(g / f"{k}.npy", mmap_mode="r")
+                      for k in LABEL_KEYS + ["face_attr", "edge_attr"] if (g / f"{k}.npy").exists()}
+
+    def __getstate__(self):  # pickling a memmap copies the whole file: drop and reopen instead
+        return {k: v for k, v in self.__dict__.items() if k not in self._MMAPS}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._open()
 
     @property
     def has_labels(self) -> bool:
@@ -153,6 +167,134 @@ def collate(items: list[dict]) -> dict:
 
 def to_device(batch: dict, device) -> dict:
     return {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
+
+
+class CopySeqDataset(CADGraphSeqDataset):
+    """Items for the v2 copy decoder: graph + analytic attributes + labels + **candidate values**
+    (exact numbers of the input B-Rep, see ``cadseq.candidates``) and, for every number in the target
+    tokens, the candidates holding its value (copy targets).
+
+    ``pose_aug`` = probability of a random axis-aligned rotation / reflection + grid translation,
+    applied consistently to the history (re-tokenized), the graph features and the candidates.
+    ``fixed_pose=True`` draws the pose from the item index (reproducible posed evaluation); the pose
+    is returned as ``pose = (R, t)``.
+    """
+
+    MAX_CANDIDATES = 4096
+    MATCH_TOL = 0.0249  # copying a candidate emits its value rounded to the 0.05 mm grid
+    _MMAPS = CADGraphSeqDataset._MMAPS + ("prim",)
+
+    def __init__(self, root, split: str = "train", pose_aug: float = 0.0, translate: float = 100.0,
+                 fixed_pose: bool = False, **kw):
+        super().__init__(root, split, **kw)
+        g = self.root / "graphs"
+        self.prim_off = {k: np.load(g / f"prim_{k}_off.npy") for k in ("points", "scalars", "planes")}
+        self.pose_aug, self.translate, self.fixed_pose = pose_aug, translate, fixed_pose
+        self._open()
+
+    def _open(self) -> None:
+        super()._open()
+        if hasattr(self, "prim_off"):
+            g = self.root / "graphs"
+            self.prim = {k: np.load(g / f"prim_{k}.npy", mmap_mode="r")
+                         for k in ("points", "point_kind", "scalars", "scalar_kind", "plane_normal", "plane_point")}
+
+    def primitives(self, k: int) -> dict:
+        a, b = self.prim_off["points"][k], self.prim_off["points"][k + 1]
+        c, d = self.prim_off["scalars"][k], self.prim_off["scalars"][k + 1]
+        e, f = self.prim_off["planes"][k], self.prim_off["planes"][k + 1]
+        return {"points": np.array(self.prim["points"][a:b]), "point_kind": np.array(self.prim["point_kind"][a:b]),
+                "scalars": np.array(self.prim["scalars"][c:d]), "scalar_kind": np.array(self.prim["scalar_kind"][c:d]),
+                "plane_normal": np.array(self.prim["plane_normal"][e:f]),
+                "plane_point": np.array(self.prim["plane_point"][e:f])}
+
+    def __getitem__(self, i: int) -> dict:
+        from .augment import transform
+        from .candidates import TAGS, candidate_values, transform_primitives, value_features
+        from .pose import random_pose, try_transform
+        from .tokenizer import COARSE_BASE, FINE_BASE, NUM_COARSE, NUM_FINE, NUM_OFFSET, decode, dequantize, encode
+
+        sid, k = self.items[i]
+        a, b = self.node_off[k], self.node_off[k + 1]
+        c, d = self.edge_off[k], self.edge_off[k + 1]
+        raw = {"node_x": np.array(self.node_x[a:b]), "edge_x": np.array(self.edge_x[c:d]),
+               "face_attr": np.array(self.extra["face_attr"][a:b]), "edge_attr": np.array(self.extra["edge_attr"][c:d])}
+        tokens = self.tokens[self.offsets[k]:self.offsets[k + 1]].astype(np.int64)
+        prims = self.primitives(k)
+
+        rng = np.random.default_rng(i) if self.fixed_pose else self.rng
+        R, t = np.eye(3), np.zeros(3)
+        if self.pose_aug > 0 and rng.random() < self.pose_aug:
+            R2, t2 = random_pose(rng, self.translate)
+            seq2 = try_transform(decode(tokens.tolist()), R2, t2)
+            if seq2 is not None:
+                R, t = R2, t2
+                tokens = np.asarray(encode(seq2), dtype=np.int64)
+                raw = transform(raw, R, t.astype(np.float32), 1.0)
+                prims = transform_primitives(prims, R, t)
+
+        values, tags = candidate_values(prims)
+        if len(values) > self.MAX_CANDIDATES:  # keep the smallest-magnitude values (rare)
+            keep = np.sort(np.argsort(np.abs(values))[: self.MAX_CANDIDATES])
+            values, tags = values[keep], tags[keep]
+        quant = np.round(values * 20).astype(np.int64)  # tokenizer grid (Q_PER_MM = 20)
+        num_pos, pairs = [], []
+        coarse = (tokens >= COARSE_BASE) & (tokens < COARSE_BASE + NUM_COARSE)
+        for p in np.nonzero(coarse)[0]:
+            v = dequantize((tokens[p] - COARSE_BASE) * NUM_FINE + (tokens[p + 1] - FINE_BASE) - NUM_OFFSET)
+            lo = np.searchsorted(values, v - self.MATCH_TOL)
+            hi = np.searchsorted(values, v + self.MATCH_TOL)
+            for cidx in range(lo, hi):
+                pairs.append((len(num_pos), cidx))
+            num_pos.append(p)
+
+        raw = scale_features(raw, self.coord_scale)
+        item = {
+            "id": sid, "pose": (R, t),
+            "edge_index": torch.from_numpy(np.array(self.edge_index[:, c:d], dtype=np.int64)),
+            "tokens": torch.from_numpy(tokens),
+            **{key: torch.from_numpy(np.ascontiguousarray(v, dtype=np.float32)) for key, v in raw.items()},
+            "cand_feat": torch.from_numpy(np.concatenate([value_features(values), tags.astype(np.float32)], 1)),
+            "cand_quant": torch.from_numpy(quant),
+            "cand_value": torch.from_numpy(values),
+            "num_pos": torch.tensor(num_pos, dtype=torch.long),
+            "copy_pairs": torch.tensor(pairs, dtype=torch.long).reshape(-1, 2),
+        }
+        for key in LABEL_KEYS:
+            if key in self.extra:
+                item[key] = torch.from_numpy(np.array(self.extra[key][a:b], dtype=np.int64))
+        return item
+
+
+def collate_copy(items: list[dict]) -> dict:
+    """``collate`` + padded candidates (B, C, F) with pad mask, numbers and copy-target pairs."""
+    out = collate(items)
+    C = max(len(it["cand_quant"]) for it in items)
+    F = items[0]["cand_feat"].shape[1]
+    B = len(items)
+    feat = torch.zeros(B, C, F)
+    quant = torch.zeros(B, C, dtype=torch.long)
+    value = torch.zeros(B, C, dtype=torch.float64)
+    pad = torch.ones(B, C, dtype=torch.bool)
+    num_b, num_pos, pair_num, pair_cand = [], [], [], []
+    n_base = 0
+    for b, it in enumerate(items):
+        n = len(it["cand_quant"])
+        feat[b, :n], quant[b, :n], value[b, :n], pad[b, :n] = it["cand_feat"], it["cand_quant"], it["cand_value"], False
+        num_b.append(torch.full((len(it["num_pos"]),), b, dtype=torch.long))
+        num_pos.append(it["num_pos"])
+        if len(it["copy_pairs"]):
+            pair_num.append(it["copy_pairs"][:, 0] + n_base)
+            pair_cand.append(it["copy_pairs"][:, 1])
+        n_base += len(it["num_pos"])
+    out.update({
+        "cand_feat": feat, "cand_quant": quant, "cand_value": value, "cand_pad": pad,
+        "num_b": torch.cat(num_b), "num_pos": torch.cat(num_pos),
+        "pair_num": torch.cat(pair_num) if pair_num else torch.zeros(0, dtype=torch.long),
+        "pair_cand": torch.cat(pair_cand) if pair_cand else torch.zeros(0, dtype=torch.long),
+        "poses": [it["pose"] for it in items],
+    })
+    return out
 
 
 class LengthBucketSampler(Sampler):

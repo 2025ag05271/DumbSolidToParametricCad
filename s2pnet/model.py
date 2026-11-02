@@ -1,17 +1,18 @@
-"""Full encoder–decoder model."""
+"""Full encoder–decoder model (v1: tokens only; v2: + exact attributes, copy head, aux segmentation)."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cadseq.tokenizer import PAD_ID
+from cadseq.tokenizer import COARSE_BASE, FINE_BASE, NUM_COARSE, NUM_FINE, NUM_OFFSET, PAD_ID
 
 from .decoder import SeqDecoder
-from .encoder import BRepEncoder
+from .encoder import BRepEncoder, _mlp
 
 
 @dataclass
@@ -23,24 +24,171 @@ class ModelConfig:
     dec_layers: int = 8
     dropout: float = 0.1
     max_len: int = 1024
+    # v2 (defaults keep v1 checkpoints loadable)
+    attrs: bool = False      # exact analytic face / edge attributes as encoder inputs
+    copy: bool = False       # pointer-generator: copy numbers from input candidate values
+    aux_seg: float = 0.0     # weight of the auxiliary per-face feature-class loss
+
+
+class CopyHead(nn.Module):
+    """Embeds the input's candidate values (value Fourier features + provenance tags, contextualised by
+    cross-attention to the B-Rep face memory) and scores them against decoder states."""
+
+    def __init__(self, d: int, feat_dim: int, heads: int, dropout: float):
+        super().__init__()
+        self.inp = _mlp(feat_dim, d, d)
+        self.n1, self.n2 = nn.LayerNorm(d), nn.LayerNorm(d)
+        self.cross = nn.MultiheadAttention(d, heads, dropout=dropout, batch_first=True)
+        self.ff = _mlp(d, 2 * d, d, dropout)
+        self.k = nn.Linear(d, d)
+        self.q = nn.Linear(d, d)
+        self.gate = nn.Linear(d, 1)
+        self.scale = 1.0 / math.sqrt(d)
+
+    def keys(self, cand_feat, mem, mem_pad):
+        c = self.inp(cand_feat)
+        c = c + self.cross(self.n1(c), mem, mem, key_padding_mask=mem_pad, need_weights=False)[0]
+        c = c + self.ff(self.n2(c))
+        return self.k(c)  # (B, C, d)
+
+    def scores(self, h, keys, cand_pad):
+        """h (B, L, d), keys (B, C, d) → (B, L, C) logits, pads −inf."""
+        s = torch.einsum("bld,bcd->blc", self.q(h), keys).float() * self.scale
+        return s.masked_fill(cand_pad[:, None, :], float("-inf"))
+
+
+class _CopyContext:
+    """Per-batch copy state for ``SeqDecoder.generate``."""
+
+    def __init__(self, head: CopyHead, keys, cand_pad, cand_quant):
+        self.head, self.keys, self.quant = head, keys, cand_quant
+        n = cand_quant + NUM_OFFSET
+        self.valid_range = (n >= 0) & (n < 2 * NUM_OFFSET) & ~cand_pad
+        n = n.clamp(0, 2 * NUM_OFFSET - 1)
+        self.coarse = COARSE_BASE + n // NUM_FINE
+        self.fine = FINE_BASE + n % NUM_FINE
+
+    def choose(self, h, rows, lo, hi, temperature, generator):
+        """For batch ``rows`` about to start a number with value bounds [lo, hi] (quantized, from the
+        grammar): (coarse, fine) tokens of the copied candidate, or −1 to generate the digits."""
+        hr = h[rows]
+        gate = torch.sigmoid(self.head.gate(hr).squeeze(-1).float())
+        q = self.head.q(h)  # all rows: avoids gathering the (B, C, d) keys
+        s = (torch.einsum("bd,bcd->bc", q, self.keys).float() * self.head.scale)[rows]
+        coarse, fine, quant = self.coarse[rows], self.fine[rows], self.quant[rows]
+        valid = self.valid_range[rows] & (quant >= lo[:, None]) & (quant <= hi[:, None])
+        s = s.masked_fill(~valid, float("-inf"))
+        if temperature > 0:
+            take = torch.rand(len(rows), device=h.device, generator=generator) < gate
+            p = torch.softmax(s / temperature, dim=-1).nan_to_num(0.0)
+            has = p.sum(-1) > 0
+            idx = torch.multinomial(torch.where(has[:, None], p, torch.ones_like(p)), 1, generator=generator).squeeze(1)
+        else:
+            take = gate > 0.5
+            idx = s.argmax(-1)
+            has = torch.isfinite(s.max(-1).values)
+        take = take & has
+        c = torch.gather(coarse, 1, idx[:, None]).squeeze(1)
+        f = torch.gather(fine, 1, idx[:, None]).squeeze(1)
+        return torch.where(take, c, torch.full_like(c, -1)), torch.where(take, f, torch.full_like(f, -1))
 
 
 class Solid2Param(nn.Module):
     def __init__(self, cfg: ModelConfig = ModelConfig()):
         super().__init__()
         self.cfg = cfg
-        self.encoder = BRepEncoder(cfg.d_model, cfg.graph_layers, cfg.enc_layers, cfg.heads, cfg.dropout)
-        self.decoder = SeqDecoder(cfg.d_model, cfg.dec_layers, cfg.heads, cfg.dropout, cfg.max_len)
+        fa = ea = 0
+        if cfg.attrs:
+            from step_to_graph import EDGE_ATTR_DIM, FACE_ATTR_DIM
 
-    def encode(self, batch):
+            fa, ea = FACE_ATTR_DIM, EDGE_ATTR_DIM
+        self.encoder = BRepEncoder(cfg.d_model, cfg.graph_layers, cfg.enc_layers, cfg.heads, cfg.dropout, fa, ea)
+        self.decoder = SeqDecoder(cfg.d_model, cfg.dec_layers, cfg.heads, cfg.dropout, cfg.max_len)
+        if cfg.copy:
+            from cadseq.candidates import N_TAGS, VALUE_FEAT_DIM
+
+            self.copy_head = CopyHead(cfg.d_model, VALUE_FEAT_DIM + N_TAGS, cfg.heads, cfg.dropout)
+        if cfg.aux_seg > 0:
+            from cadseq.provenance import FACE_CLASSES
+
+            self.seg_head = _mlp(cfg.d_model, cfg.d_model, len(FACE_CLASSES), cfg.dropout)
+
+    def encode(self, batch, return_nodes: bool = False):
         return self.encoder(batch["node_x"], batch["edge_x"], batch["edge_index"],
-                            batch["node_batch"], batch["tokens"].shape[0])
+                            batch["node_batch"], batch["tokens"].shape[0],
+                            batch.get("face_attr") if self.cfg.attrs else None,
+                            batch.get("edge_attr") if self.cfg.attrs else None, return_nodes=return_nodes)
 
     def forward(self, batch):
         mem, pad = self.encode(batch)
         return self.decoder(batch["tokens"][:, :-1], mem, pad)
 
     def loss(self, batch, label_smoothing: float = 0.0):
+        if not (self.cfg.copy or self.cfg.aux_seg > 0):
+            return self._loss_v1(batch, label_smoothing)
+        mem, pad, nodes = self.encode(batch, return_nodes=True)
+        tokens = batch["tokens"]
+        logits, hidden = self.decoder(tokens[:, :-1], mem, pad, return_hidden=True)
+        target = tokens[:, 1:]
+        logp = F.log_softmax(logits.float(), -1)
+        nll = -logp.gather(-1, target[..., None]).squeeze(-1)  # (B, L-1)
+        valid = target != PAD_ID
+        metrics = {}
+        with torch.no_grad():
+            correct = (logits.argmax(-1) == target) & valid
+            metrics["tok_acc"] = (correct.sum() / valid.sum()).item()
+            metrics["seq_acc"] = (correct | ~valid).all(1).float().mean().item()
+
+        if self.cfg.copy:
+            nb, npos = batch["num_b"], batch["num_pos"]  # number = tokens[nb, npos] (coarse), +1 (fine)
+            is_num = torch.zeros_like(valid)
+            is_num[nb, npos - 1] = True  # predicting the coarse token
+            is_num[nb, npos] = True      # predicting the fine token
+            lp_gen = logp[nb, npos - 1, tokens[nb, npos]] + logp[nb, npos, tokens[nb, npos + 1]]
+            # P(a number starts here) = total mass of the coarse tokens (vs e.g. THROUGH)
+            lp_start = torch.logsumexp(logp[nb, npos - 1, COARSE_BASE:COARSE_BASE + NUM_COARSE], -1)
+            h = hidden[nb, npos - 1]
+            g = self.copy_head.gate(h).squeeze(-1).float()
+            keys = self.copy_head.keys(batch["cand_feat"], mem, pad)
+            # scores only at number starts, one part at a time (numbers are grouped by part):
+            # avoids a (B, L, C) tensor
+            q = self.copy_head.q(h)
+            s = torch.full((len(nb), keys.shape[1]), float("-inf"), device=h.device)
+            counts = torch.bincount(nb, minlength=keys.shape[0]).tolist()
+            start = 0
+            for b, n in enumerate(counts):
+                if n:
+                    s[start:start + n] = (q[start:start + n] @ keys[b].T).float() * self.copy_head.scale
+                start += n
+            s = s.masked_fill(batch["cand_pad"][nb], float("-inf"))
+            logpi = F.log_softmax(s, -1)
+            match = torch.zeros_like(s, dtype=torch.bool)
+            match[batch["pair_num"], batch["pair_cand"]] = True
+            lse = torch.logsumexp(logpi.masked_fill(~match, float("-inf")), -1)
+            lp_num = torch.logaddexp(lp_start + F.logsigmoid(g) + lse, F.logsigmoid(-g) + lp_gen)
+            other = valid & ~is_num
+            loss = (nll[other].sum() - lp_num.sum()) / (other.sum() + len(lp_num))
+            with torch.no_grad():
+                metrics["struct_acc"] = (correct[other].sum() / other.sum()).item()
+                has = match.any(-1)
+                pick_ok = match.gather(1, s.argmax(-1, keepdim=True)).squeeze(1)
+                gen_ok = (logits[nb, npos - 1].argmax(-1) == tokens[nb, npos]) & \
+                         (logits[nb, npos].argmax(-1) == tokens[nb, npos + 1])
+                copy = g > 0
+                metrics["num_acc"] = torch.where(copy, pick_ok, gen_ok).float().mean().item()
+                metrics["copy_rate"] = copy.float().mean().item()
+                metrics["copyable"] = has.float().mean().item()
+                metrics["copy_pick_acc"] = (pick_ok[has].float().mean().item() if has.any() else 0.0)
+        else:
+            loss = nll[valid].mean()
+
+        if self.cfg.aux_seg > 0 and "face_cls" in batch:
+            seg = F.cross_entropy(self.seg_head(nodes).float(), batch["face_cls"])
+            loss = loss + self.cfg.aux_seg * seg
+            metrics["seg_loss"] = seg.item()
+        return loss, metrics
+
+    def _loss_v1(self, batch, label_smoothing):
         logits = self(batch)
         target = batch["tokens"][:, 1:]
         loss = F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), target.reshape(-1),
@@ -53,10 +201,16 @@ class Solid2Param(nn.Module):
             seq_acc = (correct | ~valid).all(1).float().mean()
         return loss, {"tok_acc": tok_acc.item(), "seq_acc": seq_acc.item()}
 
+    def copy_context(self, batch, mem, pad):
+        if not self.cfg.copy:
+            return None
+        keys = self.copy_head.keys(batch["cand_feat"], mem, pad)
+        return _CopyContext(self.copy_head, keys, batch["cand_pad"], batch["cand_quant"])
+
     @torch.no_grad()
     def generate(self, batch, **kw):
         mem, pad = self.encode(batch)
-        return self.decoder.generate(mem, pad, **kw)
+        return self.decoder.generate(mem, pad, copy=self.copy_context(batch, mem, pad), **kw)
 
     def checkpoint(self) -> dict:
         return {"config": asdict(self.cfg), "state_dict": self.state_dict()}
