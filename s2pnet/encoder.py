@@ -95,10 +95,13 @@ class EdgeConvLayer(nn.Module):
 
 class BRepEncoder(nn.Module):
     def __init__(self, d: int = 384, graph_layers: int = 4, tf_layers: int = 3, heads: int = 8,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1, face_attr_dim: int = 0, edge_attr_dim: int = 0):
         super().__init__()
         self.surf = SurfaceCNN(d)
         self.curve = CurveCNN(d)
+        # optional exact analytic attributes (step_to_graph.face_attributes / edge_attributes)
+        self.face_attr = _mlp(face_attr_dim, d, d) if face_attr_dim else None
+        self.edge_attr = _mlp(edge_attr_dim, d, d) if edge_attr_dim else None
         self.gnn = nn.ModuleList(EdgeConvLayer(d, dropout) for _ in range(graph_layers))
         layer = nn.TransformerEncoderLayer(d, heads, 4 * d, dropout, activation="gelu",
                                            batch_first=True, norm_first=True)
@@ -106,9 +109,14 @@ class BRepEncoder(nn.Module):
         self.global_tok = nn.Parameter(torch.zeros(1, 1, d))
         self.norm = nn.LayerNorm(d)
 
-    def forward(self, node_x, edge_x, edge_index, node_batch, batch_size: int):
+    def forward(self, node_x, edge_x, edge_index, node_batch, batch_size: int,
+                face_attr=None, edge_attr=None, return_nodes: bool = False):
         h = self.surf(node_x)
         e = self.curve(edge_x)
+        if self.face_attr is not None:
+            h = h + self.face_attr(face_attr)
+        if self.edge_attr is not None:
+            e = e + self.edge_attr(edge_attr)
         for layer in self.gnn:
             h, e = layer(h, e, edge_index)
 
@@ -123,5 +131,7 @@ class BRepEncoder(nn.Module):
 
         mem = torch.cat([self.global_tok.expand(batch_size, -1, -1).to(mem.dtype), mem], dim=1)
         pad = torch.cat([torch.zeros(batch_size, 1, dtype=torch.bool, device=h.device), pad], dim=1)
-        mem = self.tf(mem, src_key_padding_mask=pad)
-        return self.norm(mem), pad
+        mem = self.norm(self.tf(mem, src_key_padding_mask=pad))
+        if return_nodes:  # per-face outputs in input (ΣF) order
+            return mem, pad, mem[node_batch, slot + 1]
+        return mem, pad

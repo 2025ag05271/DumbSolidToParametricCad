@@ -55,8 +55,8 @@ STEP → B-Rep graph → encoder ─┼─ numbers: coarse token + continuous re
 | Phase | Status | What | Output |
 |---|---|---|---|
 | 0 | ⏳ | **Fix known v1 issues** (see below) | v1.1 baseline |
-| 1 | ⏳ | **Provenance labels in the generator**: face → creating feature, fillet/chamfer → source edge of the *final* solid (OCC `BRepTools_History`), face → analytic surface equation (type + parameters) | labels for every later phase |
-| 2 | ⏳ | **Feature identification** (UV-Net-style face segmentation): `identify` script that colours each face of a STEP by feature class (base, pad/boss, pocket, simple / counterbore / countersink hole, fillet, chamfer); evaluated on our test split and public benchmarks (MFCAD / MFCAD++) | standalone tool + auxiliary task for phase 3 |
+| 1 | ✅ | **Provenance labels**: face → creating feature (class, role, instance, mirror) by replaying each history with OCC operation history (`cadseq/provenance.py`, `cadseq/labels.py`) — added to the existing 20K dataset without regeneration; plus exact analytic face / edge attributes (surface type, axis, radius, convexity) | 925K labelled faces |
+| 2 | ✅ | **Feature identification** (UV-Net / AAGNet-style face segmentation): `identify.py` colours each face of a STEP by feature class, groups faces into feature regions and reads parameters from the exact B-Rep — test: 99.8 % face accuracy, mIoU 0.995, instance F1 0.984, placement-invariant. (MFCAD++ benchmark still to do) | standalone tool + auxiliary task for phase 3 |
 | 3 | ⏳ | **Hybrid decoder**: coarse+offset numbers, pointer heads, equation-residual + segmentation multi-task losses | v2 model |
 | 4 | ⏳ | **Inference**: least-squares refinement, N-sample generate-and-verify reranking; then RL fine-tuning with CAD-kernel rewards | precision + build-rate gains |
 | 5 | ⏳ | **A-surface solids**: NURBS head, G1/G2 continuity losses, freeform synthetic data | freeform reconstruction |
@@ -80,6 +80,7 @@ against the v1 baseline.
 | 0.8 | ✅ **Two Python environments** | datagen ran in the DGL venv only for historical reasons | `.venv` is now the single environment (datagen output bit-identical); DGL optional |
 | 0.9 | ✅ **Stale data on disk** | `data/synth_v1`, `data/pilot` | Deleted |
 | 0.10 | ✅ **Single greedy prediction** (quick win) | one decode per part | Generate-and-verify (8 samples, T = 0.5): test mean IoU 0.897 → **0.958**, built 94.7 % → **99.3 %**, IoU > 0.95 70.6 % → **83.2 %** — no retraining |
+| 0.11 | ✅ (generator) **Degenerate counterbores** | ~1 % of counterbores have a head deeper than the wall, leaving a plain Ø(cb) hole — ambiguous labels / targets | Generator now requires wall thickness > head + 1 mm (takes effect at the next regeneration); labels relabel existing cases as plain holes |
 
 ### Related work — comparison and what we adopt
 
@@ -125,7 +126,9 @@ Onshape terms).
 
 ```
 ├── step_to_graph.py  # STEP → UV-Net face-adjacency graph (script version of the exploration notebook);
-│                     #   the single implementation of UV-grid sampling used by the whole pipeline
+│                     #   the single implementation of UV-grid sampling used by the whole pipeline,
+│                     #   plus optional exact analytic face / edge attributes
+├── identify.py       # feature identification for a STEP: per-face classes + instances (JSON / PNG / STEP)
 ├── cadseq/
 │   ├── schema.py     # pydantic models = the JSON format (v1.0)
 │   ├── build.py      # JSON → CadQuery solid → STEP (Builder applies features incrementally)
@@ -133,11 +136,15 @@ Onshape terms).
 │   ├── tokenizer.py  # JSON ↔ token ids (quantized 0.05 mm, canonical)
 │   ├── grammar.py    # incremental token grammar → allowed-next-token sets (constrained decoding)
 │   ├── prepare.py    # pack a dataset: tokens.npz, graphs/*.npy, splits.json, vocab.json
-│   ├── dataset.py    # torch Dataset + collate (pure torch, memory-mapped)
+│   ├── dataset.py    # torch Dataset + collate (pure torch, memory-mapped; labels/attributes if present)
+│   ├── provenance.py # history-tracked replay: which feature created each face
+│   ├── labels.py     # per-face labels + analytic attributes for a dataset (+ packing)
+│   ├── augment.py    # rotation / translation / scale augmentation of graph features
 │   ├── metrics.py    # Monte Carlo IoU + Chamfer distance between solids
 │   └── workers.py    # crash/hang-tolerant supervised process pool for CAD-kernel work
 ├── s2pnet/           # model (encoder.py, decoder.py, model.py), train.py, evaluate.py, predict.py,
-│                     #   verify.py (generate-and-verify: sample, rebuild, keep the best)
+│                     #   verify.py (generate-and-verify: sample, rebuild, keep the best),
+│                     #   segment.py (feature identification model)
 ├── datagen/          # synthetic dataset generator (see below)
 ├── examples/         # SimpleRectangle.stp, simple_rectangle / bracket / flange JSON histories
 ├── THEORY.md         # study guide for the underlying theory
@@ -521,3 +528,77 @@ starts at z = 0 with sketch planes through the origin → placement canonicaliza
 Training notes: the RTX PRO 2000 laptop GPU throttles thermally (~89 °C, 915 of 3090 MHz) which halves
 throughput (≈ 48K → 24K tokens/s, 110 → 225 s/epoch). `train.py` blocks Windows idle sleep / Modern
 Standby (which once paused a run for 75 min); closing the lid still suspends it.
+
+## Face provenance labels (phase 1, `cadseq/provenance.py`, `cadseq/labels.py`)
+
+Every face of every dataset solid is labelled with the feature that created it — without regenerating
+the dataset. `TrackedBuilder` replays a history with the **same OpenCascade operations and settings**
+as `cadseq.build.Builder` (identical solid, verified), but keeps each operation's history
+(`BRepAlgoAPI_*`, `BRepFilletAPI_*`, `ShapeUpgrade_UnifySameDomain`, `BRepBuilderAPI_Transform`):
+faces that survive (possibly split or trimmed) keep their label, faces of a pad / pocket / hole tool get
+the new feature's label, faces created by a fillet / chamfer get theirs, mirror images inherit their
+source label with `mirrored = 1`, and merged faces take the label of the largest source face.
+
+```powershell
+.venv\Scripts\python.exe -m cadseq.labels data\synth_v2 --workers 16   # ~23 min for 20K parts
+```
+
+| field (`graphs/*.npy`) | meaning |
+|---|---|
+| `face_cls` | `extrude_side`, `extrude_end`, `cut_side`, `cut_end`, `hole_simple`, `hole_counterbore`, `hole_countersink`, `fillet`, `chamfer` (Fusion 360 Gallery-style taxonomy + hole kinds) |
+| `face_role` | finer role: side, end, wall, bottom, cb_wall, cb_floor, cs_cone, blend |
+| `face_instance` / `face_feature` / `face_mirror` | feature instance in the part / index of the creating feature in the history (pointer target for phase 3) / mirror image flag |
+| `face_attr` (17) | exact surface: type (plane, cylinder, cone, sphere, torus, other), axis or outward normal, location, radii, cone angle, convexity (+1 boss / −1 hole), log area |
+| `edge_attr` (9) | curve type (line, circle, ellipse, other), convex / concave / smooth, length, radius |
+
+STEP export / import can reorder faces; labels are mapped onto the STEP solid's faces geometrically
+(sample points of each stored face must lie on the replayed face; 50 of 925K faces had moved).
+Counterbores whose head is deeper than the wall (no hole wall left) are labelled as plain holes, and
+the generator now rejects them (issue 0.11 below). Analytic attributes are an optional output of
+`step_to_graph.brep_to_graph_arrays(..., with_attributes=True)`, so any STEP file gets them at inference.
+
+## Feature identification (phase 2, `s2pnet/segment.py`, `identify.py`)
+
+Per-face classification into the 9 classes above plus feature-instance grouping, as in UV-Net /
+AAGNet. The model is the B-Rep encoder (UV-grid CNNs **+ exact analytic attributes**, edge-aware message
+passing, face Transformer; 7.9M parameters) with a class head and an instance-embedding head
+(pairwise same-feature affinity, balanced BCE). Instances are evaluated as **connected feature
+regions**: one fillet feature may round several separate edges, and how a history splits equal-radius
+fillets into features is arbitrary — `identify.py` regroups regions of equal radius into one feature.
+Training applies random rotation / translation / scale (exactly consistent with an OCC transform of
+the solid, verified to 3e-5), so identification does not depend on the STEP's placement.
+
+```powershell
+.venv\Scripts\python.exe -m s2pnet.segment train --data data\synth_v2 --out runs\seg      # ~40 min
+.venv\Scripts\python.exe -m s2pnet.segment eval  --ckpt runs\seg\last.pt --split test
+.venv\Scripts\python.exe identify.py part.stp --ckpt runs\seg\last.pt --out out\part
+#   → out\part_features.json  (per-face class / region, feature list with parameters)
+#     out\part_features.png   (VTK render, faces coloured by class, visible regions numbered)
+#     out\part_features.step  (input solid with per-face colours — open in CATIA)
+```
+
+Feature parameters are read from the exact B-Rep, not estimated: hole diameter / axis / depth /
+through, counterbore diameter, countersink angle, fillet radius and convex / concave edge, extrude /
+pocket direction and height. Example (`examples/bracket.json` rebuilt as a STEP) — every feature of the
+history is recovered: 2 counterbores Ø6.6 / Ø11 through, 2 countersinks Ø5.5 / 90° through, the R8
+fillet on two edges (one feature), the concave R5 fillet, the slot pocket and the chamfer.
+
+![bracket](docs/identify_bracket.png)
+
+Test split (1000 parts), `runs/seg/last.pt`:
+
+| placement | face accuracy | mIoU (9 classes) | instance precision / recall / F1 |
+|---|---|---|---|
+| random rotation + translation + scale | **99.81 %** | **0.995** | 0.995 / 0.973 / **0.984** |
+| as generated | 99.83 % | 0.995 | 0.996 / 0.974 / 0.985 |
+| ablation: UV-grids only (no analytic attributes), random placement | 99.55 % | 0.988 | 0.989 / 0.960 / 0.974 |
+
+The exact analytic attributes cut face errors 2.4× (0.45 % → 0.19 %); the largest gains are on countersinks
+(IoU 0.962 → 0.985), plain holes and pocket floors — direct evidence for feeding exact B-Rep geometry to the
+phase-3 decoder as well.
+
+Per-class IoU: extrude side / end 0.9995 / 0.9987, cut side / end 0.9978 / 1.0, holes simple /
+counterbore / countersink 0.988 / 0.989 / 0.985, fillet 0.9999, chamfer 0.995. Instance recall per type:
+extrude 0.97, cut 0.99, holes 0.98–0.99, fillet 0.97, chamfer 0.94. For reference, published MFCAD++
+results are 99.0 % (UV-Net) and 99.3 % (AAGNet) face accuracy — a different (machining-feature) dataset,
+so not directly comparable; these numbers are in-distribution on our synthetic parts.

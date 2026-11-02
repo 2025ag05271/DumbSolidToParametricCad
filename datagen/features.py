@@ -209,6 +209,8 @@ def add_hole_group(g: Gen) -> bool:
     head = extra.get("cb_depth", 0.0)
     if "cs_diameter" in extra:
         head = (extra["cs_diameter"] / 2) / math.tan(math.radians(extra["cs_angle"] / 2))
+    if t <= head + 1.0:
+        return False  # head would consume the whole wall, leaving a plain hole
     blind_depth = q(g.rng.uniform(0.4, 0.85) * t)
     through = g.rng.random() < 0.6 or blind_depth <= head + 1.0
 

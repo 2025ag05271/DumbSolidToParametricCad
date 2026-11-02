@@ -9,6 +9,8 @@ Same logic as the notebook, as importable functions plus a command-line walkthro
     check_brep           BRepCheck validity + non-manifold edge count
     sample_face_uv_grid  (N, N, 7) face grid  [x, y, z, nx, ny, nz, trim_mask]
     sample_edge_uv_grid  (N, 6)    edge grid  [x, y, z, tx, ty, tz]
+    face_attributes      exact surface type / axis / radius / convexity of a face (optional extra)
+    edge_attributes      curve type, convex / concave / smooth, length of an edge (optional extra)
     brep_to_graph_arrays face-adjacency graph as numpy arrays (no DGL needed)
     brep_to_dgl_graph    face-adjacency graph as a DGLGraph (ndata['x'] (F, N*N*7), edata['x'] (E, N*6))
     graph_checks         the notebook's sanity checks
@@ -25,6 +27,7 @@ Usage (from solid2param/, with an environment that has cadquery-ocp; DGL/network
 from __future__ import annotations
 
 import argparse
+import math
 import random
 from pathlib import Path
 
@@ -32,13 +35,34 @@ import numpy as np
 from OCP.BRep import BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCP.BRepCheck import BRepCheck_Analyzer
+from OCP.BRepGProp import BRepGProp
 from OCP.BRepLProp import BRepLProp_CLProps, BRepLProp_SLProps
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.BRepTopAdaptor import BRepTopAdaptor_FClass2d
-from OCP.gp import gp_Dir, gp_Pnt2d
+from OCP.GeomAbs import (
+    GeomAbs_Circle,
+    GeomAbs_Cone,
+    GeomAbs_Cylinder,
+    GeomAbs_Ellipse,
+    GeomAbs_Line,
+    GeomAbs_Plane,
+    GeomAbs_Sphere,
+    GeomAbs_Torus,
+)
+from OCP.gp import gp_Dir, gp_Pnt, gp_Pnt2d, gp_Vec
+from OCP.GProp import GProp_GProps
 from OCP.IFSelect import IFSelect_RetDone
+from OCP.ShapeAnalysis import ShapeAnalysis_Surface
 from OCP.STEPControl import STEPControl_Reader
-from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_ON, TopAbs_SOLID, TopAbs_VERTEX
+from OCP.TopAbs import (
+    TopAbs_EDGE,
+    TopAbs_FACE,
+    TopAbs_IN,
+    TopAbs_ON,
+    TopAbs_REVERSED,
+    TopAbs_SOLID,
+    TopAbs_VERTEX,
+)
 from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS, TopoDS_Shape
@@ -214,15 +238,150 @@ def sample_edge_uv_grid(edge, N: int = UV_RESOLUTION) -> np.ndarray:
     return grid
 
 
+# ------------------------------------- 5b. exact analytic attributes (optional) --
+# Not part of the notebook. The B-Rep stores exact surface/curve definitions; these vectors expose
+# them to learning models next to the sampled grids (e.g. a hole's exact radius and axis).
+
+FACE_TYPES = ["plane", "cylinder", "cone", "sphere", "torus", "other"]
+CURVE_TYPES = ["line", "circle", "ellipse", "other"]
+EDGE_CONVEXITY = ["convex", "concave", "smooth"]
+# face_attr: type one-hot (6) | axis or outward plane normal (3) | location (3) | r1 | r2 |
+#            cone half-angle (rad) | convexity (+1 convex, -1 concave, 0 plane/other) | log1p(area)
+FACE_ATTR_DIM = 17
+FACE_ATTR_LENGTHS = slice(9, 14)  # mm-valued entries: location, r1, r2
+# edge_attr: curve type one-hot (4) | convexity one-hot (3) | length | radius (circle)
+EDGE_ATTR_DIM = 9
+EDGE_ATTR_LENGTHS = slice(7, 9)
+SMOOTH_COS = math.cos(math.radians(10.0))
+
+
+def _vec(v) -> np.ndarray:
+    return np.array([v.X(), v.Y(), v.Z()], dtype=np.float64)
+
+
+def _canonical_dir(d: np.ndarray) -> np.ndarray:
+    """Axis directions have no inherent sign: make the largest component positive."""
+    return d if d[np.argmax(np.abs(d))] > 0 else -d
+
+
+def _outward_normal(face, adaptor, u: float, v: float):
+    props = BRepLProp_SLProps(adaptor, u, v, 1, 1e-6)
+    if not props.IsNormalDefined():
+        return None
+    n = _vec(props.Normal())
+    return -n if face.Orientation() == TopAbs_REVERSED else n
+
+
+def _face_area(face) -> float:
+    props = GProp_GProps()
+    BRepGProp.SurfaceProperties_s(face, props)
+    return props.Mass()
+
+
+def face_attributes(face) -> np.ndarray:
+    """(FACE_ATTR_DIM,) exact surface description of a face (lengths in model units, mm)."""
+    a = BRepAdaptor_Surface(face, True)
+    out = np.zeros(FACE_ATTR_DIM, dtype=np.float32)
+    u0, u1 = max(a.FirstUParameter(), -MAX_RANGE), min(a.LastUParameter(), MAX_RANGE)
+    v0, v1 = max(a.FirstVParameter(), -MAX_RANGE), min(a.LastVParameter(), MAX_RANGE)
+    um, vm = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+    p = _vec(a.Value(um, vm))
+    n = _outward_normal(face, a, um, vm)
+    t = a.GetType()
+    kind = {GeomAbs_Plane: 0, GeomAbs_Cylinder: 1, GeomAbs_Cone: 2, GeomAbs_Sphere: 3,
+            GeomAbs_Torus: 4}.get(t, 5)
+    out[kind] = 1.0
+
+    def convexity(radial):
+        if n is None or np.linalg.norm(radial) < 1e-9:
+            return 0.0
+        return 1.0 if np.dot(n, radial) > 0 else -1.0
+
+    if kind == 0:
+        nn = n if n is not None else _vec(a.Plane().Axis().Direction())
+        out[6:9] = nn
+        out[9:12] = nn * np.dot(nn, _vec(a.Plane().Location()))  # closest point to the origin
+    elif kind in (1, 2, 4):
+        g = a.Cylinder() if kind == 1 else a.Cone() if kind == 2 else a.Torus()
+        ax = g.Axis()
+        d = _canonical_dir(_vec(ax.Direction()))
+        loc = _vec(ax.Location())
+        out[6:9] = d
+        if kind == 1:
+            out[9:12] = loc - np.dot(loc, d) * d  # axis point closest to the origin
+            out[12] = g.Radius()
+        elif kind == 2:
+            out[9:12] = _vec(g.Apex())
+            out[12] = g.RefRadius()
+            out[14] = g.SemiAngle()
+        else:
+            out[9:12] = loc
+            out[12], out[13] = g.MajorRadius(), g.MinorRadius()
+        foot = loc + np.dot(p - loc, d) * d
+        radial = p - foot
+        if kind == 4:  # distance from the torus' major circle
+            radial = radial - (radial / max(np.linalg.norm(radial), 1e-12)) * g.MajorRadius()
+        out[15] = convexity(radial)
+    elif kind == 3:
+        s = a.Sphere()
+        c = _vec(s.Location())
+        out[9:12] = c
+        out[12] = s.Radius()
+        out[15] = convexity(p - c)
+    out[16] = math.log1p(_face_area(face))
+    return out
+
+
+def edge_attributes(edge, face1, face2) -> np.ndarray:
+    """(EDGE_ATTR_DIM,) curve type, convexity between the two faces, length and radius."""
+    out = np.zeros(EDGE_ATTR_DIM, dtype=np.float32)
+    c = BRepAdaptor_Curve(edge)
+    t = c.GetType()
+    out[{GeomAbs_Line: 0, GeomAbs_Circle: 1, GeomAbs_Ellipse: 2}.get(t, 3)] = 1.0
+    props = GProp_GProps()
+    BRepGProp.LinearProperties_s(edge, props)
+    out[7] = props.Mass()
+    if t == GeomAbs_Circle:
+        out[8] = c.Circle().Radius()
+
+    tm = 0.5 * (c.FirstParameter() + c.LastParameter())
+    pnt, d1 = gp_Pnt(), gp_Vec()
+    c.D1(tm, pnt, d1)
+    tangent = _vec(d1)
+    # orient the tangent as the co-edge of face1 (material on the left of the co-edge)
+    exp = TopExp_Explorer(face1, TopAbs_EDGE)
+    while exp.More():
+        if exp.Current().IsSame(edge):
+            if exp.Current().Orientation() == TopAbs_REVERSED:
+                tangent = -tangent
+            break
+        exp.Next()
+    normals = []
+    for face in (face1, face2):
+        uv = ShapeAnalysis_Surface(BRep_Tool.Surface_s(face)).ValueOfUV(pnt, 1e-6)
+        normals.append(_outward_normal(face, BRepAdaptor_Surface(face, True), uv.X(), uv.Y()))
+    n1, n2 = normals
+    if n1 is None or n2 is None or np.dot(n1, n2) > SMOOTH_COS:
+        out[6] = 1.0  # smooth (tangent-continuous, e.g. fillet boundaries)
+    elif np.dot(np.cross(n1, n2), tangent) > 0:
+        out[4] = 1.0  # convex
+    else:
+        out[5] = 1.0  # concave
+    return out
+
+
 # --------------------------------------------- 6. face-adjacency graph build --
 
-def brep_to_graph_arrays(shape: TopoDS_Shape, N: int = UV_RESOLUTION, with_centroids: bool = False) -> dict:
+def brep_to_graph_arrays(shape: TopoDS_Shape, N: int = UV_RESOLUTION, with_centroids: bool = False,
+                         with_attributes: bool = False) -> dict:
     """
     Face-adjacency graph (UV-Net style) as numpy arrays:
         node_x     (F, N, N, 7)  face UV-grids
         edge_index (2, E)        directed graph edges (both directions per shared B-Rep edge)
         edge_x     (E, N, 6)     edge U-grids
         centroids  (F, 3)        trimmed-face centroids (only if ``with_centroids``)
+        face_attr  (F, FACE_ATTR_DIM), edge_attr (E, EDGE_ATTR_DIM)
+                                 exact analytic attributes (only if ``with_attributes``)
     """
     # 1. Index faces
     face_map = TopTools_IndexedMapOfShape()
@@ -233,10 +392,13 @@ def brep_to_graph_arrays(shape: TopoDS_Shape, N: int = UV_RESOLUTION, with_centr
     num_faces = face_map.Extent()
 
     # 2. Face UV-grids (node features) + centroids
-    node_feats, centroids = [], []
+    node_feats, centroids, face_attrs = [], [], []
     for i in range(1, num_faces + 1):
-        grid = sample_face_uv_grid(TopoDS.Face_s(face_map.FindKey(i)), N)  # (N, N, 7)
+        face = TopoDS.Face_s(face_map.FindKey(i))
+        grid = sample_face_uv_grid(face, N)  # (N, N, 7)
         node_feats.append(grid)
+        if with_attributes:
+            face_attrs.append(face_attributes(face))
         mask = grid[:, :, 6] > 0.5
         if mask.any():
             centroids.append(grid[:, :, 0:3][mask].mean(axis=0))
@@ -247,7 +409,7 @@ def brep_to_graph_arrays(shape: TopoDS_Shape, N: int = UV_RESOLUTION, with_centr
     edge_face_map = TopTools_IndexedDataMapOfShapeListOfShape()
     TopExp.MapShapesAndAncestors_s(shape, TopAbs_EDGE, TopAbs_FACE, edge_face_map)
 
-    src, dst, edge_feats = [], [], []
+    src, dst, edge_feats, edge_attrs = [], [], [], []
     for i in range(1, edge_face_map.Extent() + 1):
         fi_list = []
         for adjacent_shape in edge_face_map.FindFromIndex(i):
@@ -257,7 +419,8 @@ def brep_to_graph_arrays(shape: TopoDS_Shape, N: int = UV_RESOLUTION, with_centr
         if len(fi_list) < 2:
             continue  # boundary edge
 
-        egrid = sample_edge_uv_grid(TopoDS.Edge_s(edge_face_map.FindKey(i)), N)  # (N, 6)
+        brep_edge = TopoDS.Edge_s(edge_face_map.FindKey(i))
+        egrid = sample_edge_uv_grid(brep_edge, N)  # (N, 6)
 
         # Add graph edges (bidirectional)
         for a in range(len(fi_list)):
@@ -265,6 +428,10 @@ def brep_to_graph_arrays(shape: TopoDS_Shape, N: int = UV_RESOLUTION, with_centr
                 src += [fi_list[a], fi_list[b]]
                 dst += [fi_list[b], fi_list[a]]
                 edge_feats += [egrid, egrid]
+                if with_attributes:
+                    fa = TopoDS.Face_s(face_map.FindKey(fi_list[a] + 1))
+                    fb = TopoDS.Face_s(face_map.FindKey(fi_list[b] + 1))
+                    edge_attrs += [edge_attributes(brep_edge, fa, fb), edge_attributes(brep_edge, fb, fa)]
 
     out = {
         "node_x": np.stack(node_feats) if node_feats else np.zeros((0, N, N, 7), dtype=np.float32),
@@ -273,6 +440,9 @@ def brep_to_graph_arrays(shape: TopoDS_Shape, N: int = UV_RESOLUTION, with_centr
     }
     if with_centroids:
         out["centroids"] = np.array(centroids, dtype=np.float32).reshape(-1, 3)
+    if with_attributes:
+        out["face_attr"] = np.stack(face_attrs) if face_attrs else np.zeros((0, FACE_ATTR_DIM), np.float32)
+        out["edge_attr"] = np.stack(edge_attrs) if edge_attrs else np.zeros((0, EDGE_ATTR_DIM), np.float32)
     return out
 
 
