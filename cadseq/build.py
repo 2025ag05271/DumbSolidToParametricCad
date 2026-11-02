@@ -188,8 +188,11 @@ class Builder:
 
     def _edges(self, refs):
         if self.lenient_edges:
-            return _resolve_edges_lenient(self.body, refs, self.edge_tol)
-        return _resolve_edges(self.body, refs, self.edge_tol)
+            edges = _resolve_edges_lenient(self.body, refs, self.edge_tol)
+        else:
+            edges = _resolve_edges(self.body, refs, self.edge_tol)
+        self.last_edges = edges
+        return edges
 
     def snapshot(self):
         return dict(self.sketches), self.body
@@ -251,15 +254,20 @@ def build(seq: CADSequence, edge_tol: float = EDGE_MATCH_TOL) -> cq.Shape:
 LENIENT_SNAP = 0.03  # edge-snap tolerance as a fraction of the body's bbox diagonal
 
 
-def build_lenient(seq: CADSequence, snap: float = LENIENT_SNAP) -> tuple[cq.Shape, list[str]]:
+def build_lenient(seq: CADSequence, snap: float = LENIENT_SNAP) -> tuple[cq.Shape, list[str], CADSequence]:
     """Best-effort rebuild for model predictions.
 
     Edge refs snap to the nearest matching edge within ``snap`` × bbox diagonal (duplicates and
     unresolvable refs dropped); any feature that still fails is skipped (a skipped sketch also skips
-    its pad/pocket). Returns the body and the ids of skipped features.
+    its pad/pocket, and a sketch whose pad/pocket fails is dropped with it).
+
+    Returns (body, ids of skipped features, repaired sequence). The repaired sequence has the
+    snapped edge refs written back (exact edge mid-points) and the skipped features removed, so it
+    rebuilds the returned body with the strict ``build``.
     """
     b = Builder(lenient_edges=True)
     skipped: list[str] = []
+    kept: list = []
     for f in seq.features:
         if b.body is not None:
             b.edge_tol = max(QUANTIZED_EDGE_TOL, snap * b.body.BoundingBox().DiagonalLength)
@@ -267,9 +275,16 @@ def build_lenient(seq: CADSequence, snap: float = LENIENT_SNAP) -> tuple[cq.Shap
             b.apply(f)
         except BuildError:
             skipped.append(f.id)
+            if isinstance(f, (Pad, Pocket)) and kept and kept[-1].id == f.sketch:
+                skipped.append(kept.pop().id)
+            continue
+        if isinstance(f, (Fillet, Chamfer)):
+            f = f.model_copy(update={"edges": [edge_ref(e) for e in b.last_edges]})
+        kept.append(f)
     if b.body is None or not b.body.isValid():
         raise BuildError("no valid body could be built")
-    return b.body, skipped
+    repaired = CADSequence.model_validate({"features": [f.model_dump() for f in kept]})
+    return b.body, skipped, repaired
 
 
 def summarize(body: cq.Shape) -> dict:

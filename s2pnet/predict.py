@@ -1,13 +1,15 @@
 """Predict a design history for a STEP file.
 
 Usage:
-    .venv\\Scripts\\python.exe -m s2pnet.predict --ckpt runs/base/best.pt --step part.stp --out out/part
+    .venv\\Scripts\\python.exe -m s2pnet.predict --ckpt runs/base/last.pt --step part.stp --out out/part
+    .venv\\Scripts\\python.exe -m s2pnet.predict ... --samples 8 --temperature 0.8   # generate-and-verify
 
 Writes <out>.json (design history), <out>.txt (readable tokens) and <out>_rebuilt.step, and prints
-the IoU between the rebuilt solid and the input.
+the IoU between the rebuilt solid and the input. With ``--samples N`` the greedy prediction and
+N-1 sampled ones are rebuilt and the one that best matches the input is kept.
 
 Note: the model was trained on synthetic parts in their generated placement (absolute mm, axis-
-aligned sketch planes). Real parts in other placements need placement canonicalization (step 6).
+aligned sketch planes). Real parts in other placements need placement canonicalization.
 """
 
 from __future__ import annotations
@@ -20,13 +22,13 @@ import cadquery as cq
 import numpy as np
 import torch
 
-from cadseq.build import QUANTIZED_EDGE_TOL, build, build_lenient
 from cadseq.dataset import COORD_SCALE, collate, to_device
 from cadseq.graph import brep_to_graph_arrays
 from cadseq.metrics import mc_iou
-from cadseq.tokenizer import DecodeError, decode, to_text
+from cadseq.tokenizer import to_text
 
 from .model import Solid2Param
+from .verify import decode_candidates, generate_candidates, select_best
 
 
 def graph_item(shape: cq.Shape, uv: int = 10) -> dict:
@@ -43,6 +45,9 @@ def main() -> None:
     ap.add_argument("--ckpt", type=Path, required=True)
     ap.add_argument("--step", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True, help="output path prefix")
+    ap.add_argument("--samples", type=int, default=1, help="candidates to generate and verify")
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,29 +59,25 @@ def main() -> None:
         raise SystemExit(f"expected one solid in {args.step}, found {len(solids)}")
     shape = solids[0]
     batch = to_device(collate([graph_item(shape)]), device)
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-        seq = model.generate(batch)[0]
+    cands = generate_candidates(model, batch, args.samples, args.temperature, args.seed)[0]
+    keep, seqs = decode_candidates(cands)
+    if not seqs:
+        raise SystemExit("no prediction decoded")
+
+    best, body, history, infos = select_best(seqs, shape)
+    if best is None:
+        raise SystemExit(f"no prediction rebuilt: {infos[0].get('error_lenient') or infos[0].get('error')}")
+    tokens, info = cands[keep[best]], infos[best]
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.with_suffix(".txt").write_text(to_text(seq), encoding="utf-8")
-    try:
-        pred = decode(seq)
-    except DecodeError as e:
-        raise SystemExit(f"prediction did not decode: {e}")
-    args.out.with_suffix(".json").write_text(json.dumps(pred.model_dump(), indent=1), encoding="utf-8")
-    print(to_text(seq))
-    skipped: list[str] = []
-    try:
-        body = build(pred, edge_tol=QUANTIZED_EDGE_TOL)
-    except Exception as e:
-        print(f"strict rebuild failed ({e}); using lenient rebuild")
-        try:
-            body, skipped = build_lenient(pred)
-        except Exception as e2:
-            raise SystemExit(f"prediction did not rebuild: {e2}")
+    args.out.with_suffix(".txt").write_text(to_text(tokens), encoding="utf-8")
+    # Saved history = the one that strictly rebuilds the output solid (repaired if lenient).
+    args.out.with_suffix(".json").write_text(json.dumps(history.model_dump(), indent=1), encoding="utf-8")
+    print(to_text(tokens))
     rebuilt = args.out.parent / f"{args.out.name}_rebuilt.step"
     cq.exporters.export(cq.Workplane().add(body), str(rebuilt), cq.exporters.ExportTypes.STEP)
-    print(f"features {len(pred.features)} (skipped {skipped or 'none'}) | "
+    mode = "strict" if info["built_strict"] else f"lenient, skipped {info['skipped']} feature(s), repaired history saved"
+    print(f"candidate {keep[best]} of {len(cands)} unique ({mode}) | features {len(history.features)} | "
           f"IoU vs input {mc_iou(body, shape):.4f} | wrote {rebuilt}")
 
 
