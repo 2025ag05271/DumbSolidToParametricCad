@@ -119,7 +119,18 @@ class SeqDecoder(nn.Module):
         mask_cache: dict = {}
         vocab = self.head.out_features
         forced = torch.full((b,), -1, dtype=torch.long, device=dev)  # fine token of a copied number
-        self.copy_stats = {"numbers": 0, "copied": 0}
+        self.copy_stats = {"numbers": 0, "copied": 0, "edge_refs": 0, "pointed": 0}
+        edge = copy is not None and getattr(copy, "edge", None) is not None
+        if edge:
+            from cadseq.edgefix import CURVES
+            from cadseq.tokenizer import EDGE_TYPES, TOKEN_ID
+
+            curve_of = torch.full((vocab,), -1, dtype=torch.long, device=dev)
+            for k, v in EDGE_TYPES.items():
+                if k in CURVES:
+                    curve_of[TOKEN_ID[v]] = CURVES.index(k)
+            used = torch.zeros(copy.ve_valid.shape, dtype=torch.bool, device=dev)
+            queue = [[] for _ in range(b)]  # forced coordinate tokens of a pointed edge
 
         for t in range(max_len - 1):
             x = self.embed(cur, torch.full_like(cur, t))
@@ -168,6 +179,26 @@ class SeqDecoder(nn.Module):
                 nxt = logits.argmax(-1)
             if copy is not None:
                 starts = alive & (forced < 0) & (nxt >= COARSE_BASE) & (nxt < COARSE_BASE + NUM_COARSE)
+                if edge:
+                    queued = torch.tensor([len(q) > 0 for q in queue], device=dev)
+                    starts &= ~queued
+                    # just emitted an edge-type token → point at a virtual edge (forces x, y, z)
+                    ecurve = curve_of[cur[:, 0]]
+                    erows = torch.nonzero(alive & ~queued & (forced < 0) & (ecurve >= 0)).squeeze(1)
+                    if len(erows):
+                        pick = copy.choose_edge(h, erows, ecurve[erows], used, temperature, generator)
+                        self.copy_stats["edge_refs"] += len(erows)
+                        for r, j in zip(erows.tolist(), pick.tolist()):
+                            if j < 0:
+                                continue
+                            self.copy_stats["pointed"] += 1
+                            toks = copy.ve_tokens[r, j].tolist()
+                            nxt[r] = toks[0]
+                            queue[r] = toks[1:]
+                            used[r] |= (copy.edge[3][r] == copy.edge[3][r, j]).all(-1)  # same point
+                            starts[r] = False
+                    for r in torch.nonzero(queued).squeeze(1).tolist():
+                        nxt[r] = queue[r].pop(0)
                 rows = torch.nonzero(starts).squeeze(1)
                 if len(rows):
                     r_list = rows.tolist()

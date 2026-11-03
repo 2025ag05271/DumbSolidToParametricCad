@@ -42,9 +42,9 @@ def graph_item(shape: cq.Shape, uv: int = 10) -> dict:
             "tokens": torch.zeros(1, dtype=torch.long)}
 
 
-def copy_item(shape: cq.Shape, uv: int = 10) -> dict:
-    """Input item for v2 (copy) models: graph + analytic attributes + candidate values, exactly as
-    ``CopySeqDataset`` builds them (no target tokens)."""
+def copy_item(shape: cq.Shape, uv: int = 10, edge_ptr: bool = False) -> dict:
+    """Input item for v2 (copy) models: graph + analytic attributes + candidate values (+ virtual
+    edges for edge-pointer models), exactly as ``CopySeqDataset`` builds them (no target tokens)."""
     from cadseq.candidates import candidate_values, extract_primitives, value_features
     from cadseq.dataset import CopySeqDataset
 
@@ -55,7 +55,7 @@ def copy_item(shape: cq.Shape, uv: int = 10) -> dict:
     if len(values) > MAX_CANDIDATES:
         keep = np.sort(np.argsort(np.abs(values))[:MAX_CANDIDATES])
         values, tags = values[keep], tags[keep]
-    return {"id": "input", "pose": (np.eye(3), np.zeros(3)),
+    item = {"id": "input", "pose": (np.eye(3), np.zeros(3)),
             "edge_index": torch.from_numpy(a["edge_index"].astype(np.int64)),
             "tokens": torch.zeros(1, dtype=torch.long),
             **{k: torch.from_numpy(np.ascontiguousarray(v, dtype=np.float32)) for k, v in raw.items()},
@@ -63,6 +63,13 @@ def copy_item(shape: cq.Shape, uv: int = 10) -> dict:
             "cand_quant": torch.from_numpy(np.round(values * 20).astype(np.int64)),
             "cand_value": torch.from_numpy(values),
             "num_pos": torch.zeros(0, dtype=torch.long), "copy_pairs": torch.zeros(0, 2, dtype=torch.long)}
+    if edge_ptr:
+        from cadseq.dataset import vedge_item
+        from cadseq.edgefix import virtual_edges
+
+        ve = virtual_edges(shape)
+        item.update(vedge_item(ve["point"], ve["curve"], ve["face"], ve["sup"]))
+    return item
 
 
 def main() -> None:
@@ -92,7 +99,7 @@ def main() -> None:
         if not args.no_center:
             t = -np.round(np.array(shape.BoundingBox().center.toTuple()))
         posed = shape.translate(cq.Vector(*t)) if np.any(t) else shape
-        batch = to_device(collate_copy([copy_item(posed)]), device)
+        batch = to_device(collate_copy([copy_item(posed, edge_ptr=model.cfg.edge_ptr)]), device)
     else:
         batch = to_device(collate([graph_item(shape)]), device)
     cands = generate_candidates(model, batch, args.samples, args.temperature, args.seed)[0]

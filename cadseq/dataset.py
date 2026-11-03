@@ -62,12 +62,12 @@ class CADGraphSeqDataset(Dataset):
 
     def __init__(self, root, split: str = "train", coord_scale: float = COORD_SCALE,
                  max_len: int | None = None, limit: int | None = None, augment: bool = False,
-                 seed: int = 0):
+                 seed: int = 0, tokens: str = "tokens.npz"):
         self.root = Path(root)
         self.coord_scale = coord_scale
         self.augment = augment
         self.rng = np.random.default_rng(seed)
-        z = np.load(self.root / "tokens.npz")
+        z = np.load(self.root / tokens)
         self.tokens, self.offsets = z["tokens"], z["offsets"]
         pos = {str(sid): i for i, sid in enumerate(z["ids"])}
         g = self.root / "graphs"
@@ -178,18 +178,27 @@ class CopySeqDataset(CADGraphSeqDataset):
     applied consistently to the history (re-tokenized), the graph features and the candidates.
     ``fixed_pose=True`` draws the pose from the item index (reproducible posed evaluation); the pose
     is returned as ``pose = (R, t)``.
+
+    ``edge_ptr=True`` (phase 3b) uses the cleaned / re-targeted histories of ``cadseq.edgefix``
+    (``tokens_ef.npz``) and adds the part's **virtual edges** (sharp edges under blend faces) with,
+    for every fillet / chamfer edge ref, the virtual edges it may point to (see ``vedge_item``).
     """
 
     MAX_CANDIDATES = 4096
     MATCH_TOL = 0.0249  # copying a candidate emits its value rounded to the 0.05 mm grid
-    _MMAPS = CADGraphSeqDataset._MMAPS + ("prim",)
+    _MMAPS = CADGraphSeqDataset._MMAPS + ("prim", "vedge")
 
     def __init__(self, root, split: str = "train", pose_aug: float = 0.0, translate: float = 100.0,
-                 fixed_pose: bool = False, **kw):
+                 fixed_pose: bool = False, edge_ptr: bool = False, **kw):
+        if edge_ptr:
+            kw.setdefault("tokens", "tokens_ef.npz")
         super().__init__(root, split, **kw)
         g = self.root / "graphs"
         self.prim_off = {k: np.load(g / f"prim_{k}_off.npy") for k in ("points", "scalars", "planes")}
         self.pose_aug, self.translate, self.fixed_pose = pose_aug, translate, fixed_pose
+        self.edge_ptr = edge_ptr
+        if edge_ptr:
+            self.vedge_off = np.load(g / "vedge_off.npy")
         self._open()
 
     def _open(self) -> None:
@@ -198,6 +207,9 @@ class CopySeqDataset(CADGraphSeqDataset):
             g = self.root / "graphs"
             self.prim = {k: np.load(g / f"prim_{k}.npy", mmap_mode="r")
                          for k in ("points", "point_kind", "scalars", "scalar_kind", "plane_normal", "plane_point")}
+            if self.edge_ptr:
+                self.vedge = {k: np.load(g / f"vedge_{k}.npy", mmap_mode="r")
+                              for k in ("point", "curve", "face", "sup", "group")}
 
     def primitives(self, k: int) -> dict:
         a, b = self.prim_off["points"][k], self.prim_off["points"][k + 1]
@@ -263,7 +275,56 @@ class CopySeqDataset(CADGraphSeqDataset):
         for key in LABEL_KEYS:
             if key in self.extra:
                 item[key] = torch.from_numpy(np.array(self.extra[key][a:b], dtype=np.int64))
+        if self.edge_ptr:
+            e, f = self.vedge_off[k], self.vedge_off[k + 1]
+            point = np.array(self.vedge["point"][e:f], dtype=np.float64)
+            point = point @ R.T + t
+            item.update(vedge_item(point, np.array(self.vedge["curve"][e:f]), np.array(self.vedge["face"][e:f]),
+                                   np.array(self.vedge["sup"][e:f]), tokens, np.array(self.vedge["group"][e:f])))
         return item
+
+
+def vedge_item(point, curve, face, sup, tokens=None, group=None) -> dict:
+    """Virtual-edge inputs of one part (points already in the item's pose) and, given the target
+    ``tokens``, the edge-ref pointer targets:
+
+    ``ve_feat`` (V, 3·VALUE_FEAT_DIM + 5) Fourier features of x, y, z + curve one-hot; ``ve_quant``
+    (V, 3) grid integers; ``ve_curve`` / ``ve_face`` / ``ve_sup``; ``er_pos`` position of each edge
+    ref's first coordinate token; ``er_curve``; ``er_pairs`` (ref, virtual edge) — the virtual edges
+    at exactly the ref's point plus the others of their group (same intermediate-body edge)."""
+    from .candidates import value_features
+    from .edgefix import CURVES
+    from .tokenizer import COARSE_BASE, EDGE_TYPES, FINE_BASE, NUM_FINE, NUM_OFFSET, TOKEN_ID
+
+    point = np.asarray(point, dtype=np.float64).reshape(-1, 3)
+    quant = np.round(point * 20).astype(np.int64)
+    curve = np.asarray(curve, dtype=np.int64)
+    onehot = np.eye(len(CURVES), dtype=np.float32)[curve]
+    feat = np.concatenate([value_features(point[:, 0]), value_features(point[:, 1]), value_features(point[:, 2]),
+                           onehot], 1).astype(np.float32)
+    out = {"ve_feat": torch.from_numpy(feat), "ve_quant": torch.from_numpy(quant), "ve_curve": torch.from_numpy(curve),
+           "ve_face": torch.from_numpy(np.asarray(face, dtype=np.int64)),
+           "ve_sup": torch.from_numpy(np.asarray(sup, dtype=np.int64).reshape(-1, 2))}
+    if tokens is None:
+        return out
+    e_ids = {TOKEN_ID[v]: CURVES.index(k) for k, v in EDGE_TYPES.items() if k in CURVES}
+    er_pos, er_curve, pairs = [], [], []
+    for p in np.nonzero(np.isin(tokens, list(e_ids)))[0]:
+        q = np.array([(tokens[p + 1 + 2 * c] - COARSE_BASE) * NUM_FINE + (tokens[p + 2 + 2 * c] - FINE_BASE) - NUM_OFFSET
+                      for c in range(3)])
+        cid = e_ids[int(tokens[p])]
+        m = np.nonzero(np.all(quant == q, 1) & (curve == cid))[0]
+        if len(m) and group is not None:
+            g = group[m]
+            g = g[g >= 0]
+            if len(g):
+                m = np.union1d(m, np.nonzero((group == g[0]) & (curve == cid))[0])
+        pairs += [(len(er_pos), int(j)) for j in m]
+        er_pos.append(int(p) + 1)
+        er_curve.append(cid)
+    out.update({"er_pos": torch.tensor(er_pos, dtype=torch.long), "er_curve": torch.tensor(er_curve, dtype=torch.long),
+                "er_pairs": torch.tensor(pairs, dtype=torch.long).reshape(-1, 2)})
+    return out
 
 
 def collate_copy(items: list[dict]) -> dict:
@@ -294,7 +355,37 @@ def collate_copy(items: list[dict]) -> dict:
         "pair_cand": torch.cat(pair_cand) if pair_cand else torch.zeros(0, dtype=torch.long),
         "poses": [it["pose"] for it in items],
     })
+    if "ve_feat" in items[0]:
+        out.update(_collate_vedges(items))
     return out
+
+
+def _collate_vedges(items: list[dict]) -> dict:
+    B = len(items)
+    V = max(1, max(len(it["ve_curve"]) for it in items))
+    F = items[0]["ve_feat"].shape[1]
+    feat, quant = torch.zeros(B, V, F), torch.zeros(B, V, 3, dtype=torch.long)
+    curve, face = torch.full((B, V), -1, dtype=torch.long), torch.zeros(B, V, dtype=torch.long)
+    sup, pad = torch.zeros(B, V, 2, dtype=torch.long), torch.ones(B, V, dtype=torch.bool)
+    er_b, er_pos, er_curve, pr, pv = [], [], [], [], []
+    base = 0
+    for b, it in enumerate(items):
+        n = len(it["ve_curve"])
+        feat[b, :n], quant[b, :n], curve[b, :n] = it["ve_feat"], it["ve_quant"], it["ve_curve"]
+        face[b, :n], sup[b, :n], pad[b, :n] = it["ve_face"], it["ve_sup"], False
+        if "er_pos" in it:
+            er_b.append(torch.full((len(it["er_pos"]),), b, dtype=torch.long))
+            er_pos.append(it["er_pos"])
+            er_curve.append(it["er_curve"])
+            if len(it["er_pairs"]):
+                pr.append(it["er_pairs"][:, 0] + base)
+                pv.append(it["er_pairs"][:, 1])
+            base += len(it["er_pos"])
+    z = torch.zeros(0, dtype=torch.long)
+    return {"ve_feat": feat, "ve_quant": quant, "ve_curve": curve, "ve_face": face, "ve_sup": sup, "ve_pad": pad,
+            "er_b": torch.cat(er_b) if er_b else z, "er_pos": torch.cat(er_pos) if er_pos else z,
+            "er_curve": torch.cat(er_curve) if er_curve else z,
+            "er_pair_ref": torch.cat(pr) if pr else z, "er_pair_ve": torch.cat(pv) if pv else z}
 
 
 class LengthBucketSampler(Sampler):

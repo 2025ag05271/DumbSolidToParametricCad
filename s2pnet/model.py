@@ -28,6 +28,7 @@ class ModelConfig:
     attrs: bool = False      # exact analytic face / edge attributes as encoder inputs
     copy: bool = False       # pointer-generator: copy numbers from input candidate values
     aux_seg: float = 0.0     # weight of the auxiliary per-face feature-class loss
+    edge_ptr: bool = False   # phase 3b: fillet / chamfer edge refs point at virtual (sharp) edges
 
 
 class CopyHead(nn.Module):
@@ -57,16 +58,63 @@ class CopyHead(nn.Module):
         return s.masked_fill(cand_pad[:, None, :], float("-inf"))
 
 
+class EdgeHead(CopyHead):
+    """Pointer over the input's virtual edges (``cadseq.blends``): keys from the sharp-edge point /
+    curve type plus the embeddings of the blend face and its two support faces."""
+
+    def __init__(self, d: int, feat_dim: int, heads: int, dropout: float):
+        super().__init__(d, feat_dim, heads, dropout)
+        self.faces = nn.Linear(3 * d, d)
+
+    def keys(self, feat, face, sup, mem, mem_pad):
+        idx = torch.cat([face[..., None], sup], -1) + 1  # memory slot 0 is the [GLOBAL] token
+        idx = idx.clamp(max=mem.shape[1] - 1)
+        fe = torch.gather(mem, 1, idx.reshape(idx.shape[0], -1, 1).expand(-1, -1, mem.shape[-1]))
+        c = self.inp(feat) + self.faces(fe.reshape(*idx.shape[:2], -1))
+        c = c + self.cross(self.n1(c), mem, mem, key_padding_mask=mem_pad, need_weights=False)[0]
+        c = c + self.ff(self.n2(c))
+        return self.k(c)
+
+
 class _CopyContext:
     """Per-batch copy state for ``SeqDecoder.generate``."""
 
-    def __init__(self, head: CopyHead, keys, cand_pad, cand_quant):
+    def __init__(self, head: CopyHead, keys, cand_pad, cand_quant, edge=None):
         self.head, self.keys, self.quant = head, keys, cand_quant
         n = cand_quant + NUM_OFFSET
         self.valid_range = (n >= 0) & (n < 2 * NUM_OFFSET) & ~cand_pad
         n = n.clamp(0, 2 * NUM_OFFSET - 1)
         self.coarse = COARSE_BASE + n // NUM_FINE
         self.fine = FINE_BASE + n % NUM_FINE
+        self.edge = edge  # (EdgeHead, keys, ve_pad, ve_quant, ve_curve) or None
+        if edge is not None:
+            _, _, ve_pad, ve_quant, _ = edge
+            n = ve_quant + NUM_OFFSET  # (B, V, 3)
+            self.ve_valid = ((n >= 0) & (n < 2 * NUM_OFFSET)).all(-1) & ~ve_pad
+            n = n.clamp(0, 2 * NUM_OFFSET - 1)
+            # (B, V, 6): coarse/fine token pairs of x, y, z
+            self.ve_tokens = torch.stack([COARSE_BASE + n // NUM_FINE, FINE_BASE + n % NUM_FINE], -1).flatten(-2)
+
+    def choose_edge(self, h, rows, curve, used, temperature, generator):
+        """For batch ``rows`` that just emitted an edge-type token (curve index ``curve``): index of the
+        virtual edge to point at, or −1 to fall back to copying / generating the coordinates.
+        ``used`` (B, V) masks edges already referenced."""
+        head, keys, _, _, ve_curve = self.edge
+        hr = h[rows]
+        gate = torch.sigmoid(head.gate(hr).squeeze(-1).float())
+        q = head.q(h)
+        s = (torch.einsum("bd,bcd->bc", q, keys).float() * head.scale)[rows]
+        valid = self.ve_valid[rows] & (ve_curve[rows] == curve[:, None]) & ~used[rows]
+        s = s.masked_fill(~valid, float("-inf"))
+        has = torch.isfinite(s.max(-1).values)
+        if temperature > 0:
+            take = torch.rand(len(rows), device=h.device, generator=generator) < gate
+            p = torch.softmax(s / temperature, dim=-1).nan_to_num(0.0)
+            idx = torch.multinomial(torch.where(has[:, None], p, torch.ones_like(p)), 1, generator=generator).squeeze(1)
+        else:
+            take = gate > 0.5
+            idx = s.argmax(-1)
+        return torch.where(take & has, idx, torch.full_like(idx, -1))
 
     def choose(self, h, rows, lo, hi, temperature, generator):
         """For batch ``rows`` about to start a number with value bounds [lo, hi] (quantized, from the
@@ -108,6 +156,11 @@ class Solid2Param(nn.Module):
             from cadseq.candidates import N_TAGS, VALUE_FEAT_DIM
 
             self.copy_head = CopyHead(cfg.d_model, VALUE_FEAT_DIM + N_TAGS, cfg.heads, cfg.dropout)
+        if cfg.edge_ptr:
+            from cadseq.candidates import VALUE_FEAT_DIM
+            from cadseq.edgefix import CURVES
+
+            self.edge_head = EdgeHead(cfg.d_model, 3 * VALUE_FEAT_DIM + len(CURVES), cfg.heads, cfg.dropout)
         if cfg.aux_seg > 0:
             from cadseq.provenance import FACE_CLASSES
 
@@ -179,6 +232,10 @@ class Solid2Param(nn.Module):
                 metrics["copy_rate"] = copy.float().mean().item()
                 metrics["copyable"] = has.float().mean().item()
                 metrics["copy_pick_acc"] = (pick_ok[has].float().mean().item() if has.any() else 0.0)
+            if self.cfg.edge_ptr and len(batch["er_pos"]):
+                ptr, ptr_metrics = self._edge_loss(batch, hidden, mem, pad)
+                loss = loss + ptr / (other.sum() + len(lp_num))
+                metrics.update(ptr_metrics)
         else:
             loss = nll[valid].mean()
 
@@ -201,11 +258,46 @@ class Solid2Param(nn.Module):
             seq_acc = (correct | ~valid).all(1).float().mean()
         return loss, {"tok_acc": tok_acc.item(), "seq_acc": seq_acc.item()}
 
+    def _edge_loss(self, batch, hidden, mem, pad):
+        """Summed pointer NLL over edge refs: gate·π(any virtual edge of the ref's group) when the ref
+        has targets, else the gate must decline (fallback to number copying / generation)."""
+        eb, epos = batch["er_b"], batch["er_pos"]
+        head = self.edge_head
+        h = hidden[eb, epos - 1]
+        g = head.gate(h).squeeze(-1).float()
+        keys = head.keys(batch["ve_feat"], batch["ve_face"], batch["ve_sup"], mem, pad)
+        q = head.q(h)
+        s = torch.full((len(eb), keys.shape[1]), float("-inf"), device=h.device)
+        start = 0
+        for b, n in enumerate(torch.bincount(eb, minlength=keys.shape[0]).tolist()):
+            if n:
+                s[start:start + n] = (q[start:start + n] @ keys[b].T).float() * head.scale
+            start += n
+        valid = ~batch["ve_pad"][eb] & (batch["ve_curve"][eb] == batch["er_curve"][:, None])
+        s = s.masked_fill(~valid, float("-inf"))
+        match = torch.zeros_like(s, dtype=torch.bool)
+        match[batch["er_pair_ref"], batch["er_pair_ve"]] = True
+        match &= valid
+        has = match.any(-1)
+        logpi = F.log_softmax(s.masked_fill(~valid.any(-1, keepdim=True), 0.0), -1)
+        lp = torch.logsumexp(logpi.masked_fill(~match, float("-inf")), -1)
+        nll = torch.where(has, -(F.logsigmoid(g) + lp.nan_to_num(0.0, neginf=0.0)), -F.logsigmoid(-g))
+        with torch.no_grad():
+            pick = match.gather(1, s.argmax(-1, keepdim=True)).squeeze(1)
+            metrics = {"ptr_has": has.float().mean().item(),
+                       "ptr_rate": (g > 0).float().mean().item(),
+                       "ptr_acc": ((pick & (g > 0))[has].float().mean().item() if has.any() else 0.0)}
+        return nll.sum(), metrics
+
     def copy_context(self, batch, mem, pad):
         if not self.cfg.copy:
             return None
         keys = self.copy_head.keys(batch["cand_feat"], mem, pad)
-        return _CopyContext(self.copy_head, keys, batch["cand_pad"], batch["cand_quant"])
+        edge = None
+        if self.cfg.edge_ptr and "ve_feat" in batch:
+            ekeys = self.edge_head.keys(batch["ve_feat"], batch["ve_face"], batch["ve_sup"], mem, pad)
+            edge = (self.edge_head, ekeys, batch["ve_pad"], batch["ve_quant"], batch["ve_curve"])
+        return _CopyContext(self.copy_head, keys, batch["cand_pad"], batch["cand_quant"], edge)
 
     @torch.no_grad()
     def generate(self, batch, **kw):

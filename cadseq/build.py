@@ -287,6 +287,51 @@ def build_lenient(seq: CADSequence, snap: float = LENIENT_SNAP) -> tuple[cq.Shap
     return b.body, skipped, repaired
 
 
+SMOOTH_DOT = 0.999  # face normals across an edge closer than ~2.6° → tangent (G1) edge
+
+
+def is_smooth_edge(body: cq.Shape, edge: cq.Edge) -> bool:
+    """True if ``edge`` is a seam or joins two tangent faces — filleting / chamfering it is a no-op
+    (or fails) and it leaves no trace in the final solid."""
+    from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
+    from OCP.TopExp import TopExp
+    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
+    from OCP.TopoDS import TopoDS
+
+    from .blends import _normal
+
+    m = TopTools_IndexedDataMapOfShapeListOfShape()
+    TopExp.MapShapesAndAncestors_s(body.wrapped, TopAbs_EDGE, TopAbs_FACE, m)
+    faces = list(m.FindFromKey(edge.wrapped)) if m.Contains(edge.wrapped) else []
+    uniq = []
+    for f in faces:
+        if not any(f.IsSame(g) for g in uniq):
+            uniq.append(f)
+    if len(uniq) < 2:
+        return True  # seam of a periodic face
+    n1, n2 = _normal(TopoDS.Face_s(uniq[0]), edge.wrapped), _normal(TopoDS.Face_s(uniq[1]), edge.wrapped)
+    return n1 is not None and n2 is not None and float(n1 @ n2) > SMOOTH_DOT
+
+
+def prune_smooth_edges(seq: CADSequence, edge_tol: float = EDGE_MATCH_TOL) -> tuple[CADSequence, int]:
+    """Drop fillet / chamfer edge refs that point at smooth edges (see ``is_smooth_edge``) and
+    fillets / chamfers left without edges. Such refs cannot be inferred from the final solid.
+    Returns (pruned sequence, number of refs removed); raises BuildError if the replay fails."""
+    b = Builder(edge_tol=edge_tol)
+    kept, removed = [], 0
+    for f in seq.features:
+        if isinstance(f, (Fillet, Chamfer)):
+            edges = b._edges(f.edges)
+            keep = [r for r, e in zip(f.edges, edges) if not is_smooth_edge(b.body, e)]
+            removed += len(f.edges) - len(keep)
+            if not keep:
+                continue
+            f = f.model_copy(update={"edges": keep})
+        b.apply(f)
+        kept.append(f)
+    return CADSequence.model_validate({"features": [f.model_dump() for f in kept]}), removed
+
+
 def summarize(body: cq.Shape) -> dict:
     bb = body.BoundingBox()
     return {

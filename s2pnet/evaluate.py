@@ -82,7 +82,8 @@ def main() -> None:
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     model = Solid2Param.from_checkpoint(ckpt["model"]).to(device).eval()
     if model.cfg.copy:
-        ds = CopySeqDataset(args.data, args.split, limit=args.n, pose_aug=1.0 if args.pose else 0.0, fixed_pose=True)
+        ds = CopySeqDataset(args.data, args.split, limit=args.n, pose_aug=1.0 if args.pose else 0.0, fixed_pose=True,
+                            edge_ptr=model.cfg.edge_ptr)
         coll = collate_copy
     else:
         if args.pose:

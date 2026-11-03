@@ -115,7 +115,7 @@ def generation_eval(model, ds, device, amp_dtype, n: int, batch_size: int = 32, 
     n = min(n, len(ds))
     exact = valid = feat_ok = 0
     errs, seqs = [], []
-    copied = numbers = 0
+    copied = numbers = edge_refs = pointed = 0
     t0 = time.time()
     for s in range(0, n, batch_size):
         batch = to_device(coll([ds[i] for i in range(s, min(n, s + batch_size))]), device)
@@ -124,6 +124,7 @@ def generation_eval(model, ds, device, amp_dtype, n: int, batch_size: int = 32, 
         st = getattr(model.decoder, "copy_stats", None)
         if st:
             copied, numbers = copied + st["copied"], numbers + st["numbers"]
+            edge_refs, pointed = edge_refs + st.get("edge_refs", 0), pointed + st.get("pointed", 0)
         for seq, gt, L in zip(outs, batch["tokens"].tolist(), batch["lengths"].tolist()):
             gt = gt[:L]
             seqs.append(seq)
@@ -141,6 +142,8 @@ def generation_eval(model, ds, device, amp_dtype, n: int, batch_size: int = 32, 
                "gen_seconds": round(time.time() - t0, 1)}
     if numbers:
         metrics["gen_copy_rate"] = copied / numbers
+    if edge_refs:
+        metrics["gen_pointer_rate"] = pointed / edge_refs
     return metrics, seqs
 
 
@@ -220,9 +223,9 @@ def main() -> None:
 
     if cfg.copy:
         train_ds = CopySeqDataset(args.data, "train", pose_aug=args.pose_aug, max_len=args.max_seq,
-                                  limit=args.limit, seed=args.seed)
+                                  limit=args.limit, seed=args.seed, edge_ptr=cfg.edge_ptr)
         val_ds = CopySeqDataset(args.data, args.val_split, max_len=args.max_seq,
-                                limit=args.limit if args.val_split == "train" else None)
+                                limit=args.limit if args.val_split == "train" else None, edge_ptr=cfg.edge_ptr)
         coll = collate_copy
     else:
         train_ds = CADGraphSeqDataset(args.data, "train", max_len=args.max_seq, limit=args.limit)

@@ -57,7 +57,7 @@ STEP → B-Rep graph → encoder ─┼─ numbers: coarse token + continuous re
 | 0 | ⏳ | **Fix known v1 issues** (see below) | v1.1 baseline |
 | 1 | ✅ | **Provenance labels**: face → creating feature (class, role, instance, mirror) by replaying each history with OCC operation history (`cadseq/provenance.py`, `cadseq/labels.py`) — added to the existing 20K dataset without regeneration; plus exact analytic face / edge attributes (surface type, axis, radius, convexity) | 925K labelled faces |
 | 2 | ✅ | **Feature identification** (UV-Net / AAGNet-style face segmentation): `identify.py` colours each face of a STEP by feature class, groups faces into feature regions and reads parameters from the exact B-Rep — test: 99.8 % face accuracy, mIoU 0.995, instance F1 0.984, placement-invariant. (MFCAD++ benchmark still to do) | standalone tool + auxiliary task for phase 3 |
-| 3 | ⏳ | **Hybrid decoder**: coarse+offset numbers, pointer heads, equation-residual + segmentation multi-task losses | v2 model |
+| 3 | 🔶 | **Hybrid decoder**: ✅ copy head over exact input B-Rep values (pointer-generator), grammar value ranges, pose augmentation, aux segmentation — test (verified): IoU > 0.99 23 % → 58 %, median 0.978 → 0.994; ⏳ 3b edge-reference pointer to recovered sharp edges; equation-residual losses | v2 model |
 | 4 | ⏳ | **Inference**: least-squares refinement, N-sample generate-and-verify reranking; then RL fine-tuning with CAD-kernel rewards | precision + build-rate gains |
 | 5 | ⏳ | **A-surface solids**: NURBS head, G1/G2 continuity losses, freeform synthetic data | freeform reconstruction |
 | 6 | ⏳ | **CATIA rebuild** (was step 3): JSON → CATIA V5 R29 feature tree via CAA (COM automation prototype first) | parametric CATIA parts |
@@ -602,3 +602,123 @@ counterbore / countersink 0.988 / 0.989 / 0.985, fillet 0.9999, chamfer 0.995. I
 extrude 0.97, cut 0.99, holes 0.98–0.99, fillet 0.97, chamfer 0.94. For reference, published MFCAD++
 results are 99.0 % (UV-Net) and 99.3 % (AAGNet) face accuracy — a different (machining-feature) dataset,
 so not directly comparable; these numbers are in-distribution on our synthetic parts.
+
+## Hybrid copy decoder (phase 3, `runs/v2`)
+
+v1 generates every number digit by digit (0.05 mm grid), so its IoU is capped by small dimension and
+position errors. v2 keeps the token decoder for structure but **copies numbers from the input B-Rep**:
+
+- **Candidates** (`cadseq/candidates.py`): every exact value of the input solid that a history could
+  use — vertex / circle-centre / arc / edge-midpoint coordinates (±), plane offsets (±), bounding box,
+  radii, diameters, cone angles, and per-axis differences of positions — deduplicated to 1e-4 mm and
+  tagged with their origin (18 multi-hot tags). Median 446 per part; **98.9 % of all ground-truth numbers
+  occur exactly** in their part's candidate set.
+- **Copy head** (`s2pnet/model.py`, pointer-generator): candidate embeddings (Fourier value features +
+  tags, cross-attending to the face memory) are scored against the decoder state. A gate mixes
+  "copy candidate k" with "generate the digits"; the loss marginalises over every candidate holding the
+  target value: `log p(num) = logaddexp(log P(start)·σ(g)·Σ_match π_k, σ(−g)·p_gen)`.
+- **Grammar value ranges** (`cadseq/grammar.py`): each number slot has a quantized range (e.g. a
+  counterbore hole diameter must be below the head diameter); copying only considers candidates in range.
+- **Pose augmentation** (`cadseq/pose.py`, `--pose-aug 0.75`): one of the 48 signed axis permutations +
+  a grid-aligned translation up to ±100 mm, applied consistently to the history (re-expressed in
+  canonical sketch frames and re-tokenized), the graph features and the candidates. Verified: rebuilt
+  solid IoU 1.0 against the OCC-transformed reference, and the inverse transform round-trips exactly.
+- Inputs also include the exact analytic face / edge attributes (`--attrs`) and an auxiliary face-class
+  loss (`--aux-seg 0.2`). 39.7M parameters.
+
+```powershell
+.venv\Scripts\python.exe -m cadseq.candidates data\synth_v2 --workers 16     # once: pack candidate primitives
+.venv\Scripts\python.exe -m s2pnet.train --data data\synth_v2 --out runs\v2 --epochs 60 --bs 24 --attrs --copy --aux-seg 0.2 --pose-aug 0.75 --loader-workers 4
+.venv\Scripts\python.exe -m s2pnet.evaluate --ckpt runs\v2\best.pt --split test --n 1000 --samples 8 --temperature 0.5 [--pose]
+.venv\Scripts\python.exe -m s2pnet.predict --ckpt runs\v2\best.pt --step part.stp --out out\part --samples 8 --temperature 0.5
+```
+
+`predict.py` builds the same inputs from the STEP and, for copy models, moves the bounding-box centre
+(rounded to whole mm, so every input value stays on the grid) to the origin and maps the predicted
+history back (`--no-center` to disable). Arbitrarily rotated parts still need axis alignment.
+
+Training: batch 24 (peak 6.6 GB; validation uses the training batch size — at 2× it spilled into
+shared memory), ~280 s/epoch on the throttled laptop GPU, 60 epochs ≈ 4.7 h.
+
+### Results — test split, 1000 parts
+
+| model / inference | exact | built (strict / lenient) | IoU mean | IoU median | > 0.9 | > 0.95 | > 0.99 |
+|---|---|---|---|---|---|---|---|
+| v1 greedy | 0 % | 15.1 % / 94.7 % | 0.897 | 0.970 | 84.6 % | 70.6 % | 13.9 % |
+| **v2 greedy** | 2.8 % | 15.4 % / 95.6 % | 0.909 | 0.987 | 85.5 % | 74.8 % | **44.3 %** |
+| v1 + generate-and-verify (8, T = 0.5) | 0 % | 15.8 % / 99.3 % | 0.958 | 0.978 | 94.4 % | 83.2 % | 23.1 % |
+| **v2 + generate-and-verify** (8, T = 0.5) | 3.1 % | 19.5 % / 98.7 % | **0.960** | **0.994** | 93.8 % | **87.1 %** | **58.0 %** |
+| v2 + generate-and-verify, **random pose** (signed axis permutation + ±100 mm) | 1.8 % | 15.2 % / 98.7 % | 0.932 | 0.982 | 85.7 % | 71.2 % | 40.4 % |
+
+Copying **triples the share of near-perfect parts** (IoU > 0.99: 13.9 % → 44.3 % greedy, 23.1 % → 58.0 %
+with verification) — numbers are now exact rather than within ~0.5 mm. In random poses the model is
+weaker (0.932 mean, 40 % > 0.99; 25 % of training items were unposed) but still ahead of v1 in its home
+placement. Per family (verified, median IoU / > 0.95 / > 0.99, v1 → v2):
+
+| family | median IoU | IoU > 0.95 | IoU > 0.99 |
+|---|---|---|---|
+| flange | 0.990 → 0.997 | 94 % → 93 % | 49 % → 74 % |
+| t_block | 0.979 → 0.997 | 84 % → 85 % | 19 % → 68 % |
+| l_bracket | 0.979 → 0.995 | 88 % → 89 % | 17 % → 62 % |
+| gusset_bracket | 0.975 → 0.995 | 82 % → 95 % | 12 % → 64 % |
+| hub_disc | 0.990 → 0.993 | 95 % → 93 % | 50 % → 55 % |
+| u_channel | 0.969 → 0.992 | 75 % → 89 % | 11 % → 52 % |
+| block | 0.969 → 0.991 | 78 % → 85 % | 5 % → 52 % |
+| stepped_shaft | 0.969 → 0.990 | 72 % → 76 % | 17 % → 49 % |
+| plate | 0.974 → 0.987 | 77 % → 81 % | 10 % → 47 % |
+
+`examples/SimpleRectangle.stp` — v1: IoU 0.21 (wrong placement convention); **v2: IoU 1.0, strict
+rebuild**, the 122.1 × 88.8 × 20 mm dimensions copied from the input:
+
+```
+SKETCH +X -10 PROFILE LOOP LINE -61.05 -44.4 LINE 61.05 -44.4 LINE 61.05 44.4 LINE -61.05 44.4
+PAD EXT+ 20
+```
+
+### Remaining bottleneck: fillet / chamfer edge references
+
+Strict rebuilds stay at ~15–20 %. Of the 846 greedy strict failures, **644 are edge references** (fillet
+543, chamfer 101; median miss 2 mm). Teacher-forced copy accuracy per number role (400 test parts):
+
+| number role | share | copyable | copy pick accuracy |
+|---|---|---|---|
+| sketch curve coordinates | 39 % | 99.1 % | 94.2 % |
+| **edge-reference point coordinates** | **25 %** | 97.4 % | **64.1 %** |
+| sketch plane offsets | 23 % | 99.7 % | 86–93 % |
+| fillet / chamfer size | 3 % | 99.6 % | 80.0 % |
+| extrude lengths, hole parameters | 10 % | 97–100 % | 80–98 % |
+
+An edge ref is the midpoint of an edge of the *intermediate* body — an edge the fillet itself removed,
+so it does not exist in the input; the model must assemble x, y, z independently from candidates.
+Two findings drive phase 3b:
+
+1. **21 % of all edge refs in synth_v2 are no-ops**: the generator picked smooth edges (tangent joins
+   of earlier fillets, arc–line seams of slots, periodic seams). Filleting them changes nothing, so they
+   cannot be inferred from the solid — pure label noise the model learned to imitate.
+   `cadseq.build.prune_smooth_edges` removes them; the pruned histories rebuild the same solids
+   (IoU ≥ 0.9997 on 110 test parts, no features lost).
+2. **The removed sharp edges can be recovered analytically** (`cadseq/blends.py`): intersect the
+   blend face's two support surfaces (`GeomAPI_IntSS`) and project the blend face onto the curve.
+   ~0.1 s per part, label-free; **94–96 % of the remaining refs lie on a recovered edge**, and
+   histories re-targeted to recovered points rebuild strictly with IoU 1.0. (OCC's
+   `BRepAlgoAPI_Defeaturing` was tried first: up to 100 s per face and no usable history.)
+
+### Phase 3b — edge pointer (in progress)
+
+- `cadseq/edgefix.py`: prunes smooth refs, computes virtual edges for every face, links each ref to
+  the virtual edges lying on its exact intermediate-body edge (a pointer *group*), moves the ref point
+  onto the grid-snapped virtual point and verifies the rebuild (volume) → `tokens_ef.npz`,
+  `graphs/vedge_*.npy`. synth_v2 (20K, 8 workers, ~45 min): 153,210 refs, **32,594 smooth (21.3 %)
+  pruned, 113,277 of the remaining 120,616 (93.9 %) linked** to a virtual edge; 189 samples (0.9 %) keep
+  their original tokens (replay or volume check failed); ~200 virtual edges per part.
+- `--edge-ptr`: an `EdgeHead` scores virtual edges (point Fourier features + curve type + embeddings of
+  the blend face and its support faces). After an `E_LINE` / `E_CIRCLE` token a gate chooses "point at
+  virtual edge k" (its x, y, z tokens are forced) or falls back to copying the coordinates; already
+  used edges are masked. Loss: `−log σ(g) − log Σ_group π_k` for refs with targets, `−log σ(−g)` otherwise.
+- Sanity check: 64 training parts memorised → pointer used for 91 % of generated edge refs, 98.4 %
+  strict rebuilds, IoU 0.99996 (token-exact 91 %: the pointer may pick another point on the same edge).
+
+```powershell
+.venv\Scripts\python.exe -m cadseq.edgefix data\synth_v2 --workers 8     # once
+.venv\Scripts\python.exe -m s2pnet.train --data data\synth_v2 --out runs\v3 --epochs 60 --bs 24 --attrs --copy --aux-seg 0.2 --edge-ptr --pose-aug 0.75 --loader-workers 4
+```
