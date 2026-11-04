@@ -377,6 +377,219 @@ B-spline knot multiplicity", "curvature comb", "zebra stripe analysis", "reflect
 
 ---
 
+## Part O — The solid2param pipeline, end to end (theory)
+
+This part describes what happens, conceptually, from the moment a STEP file is given to the system
+until a design-history JSON comes out. It explains where the **equations of the geometry** enter the
+pipeline and why they make the result precise. It also says plainly what "geometry-informed" (GINN)
+means in this project: what is implemented, and what is still planned.
+
+### O.1 The problem, stated formally
+
+The input is a solid S: a closed region of ℝ³ whose boundary ∂S is given as a B-Rep (faces, edges,
+vertices, each carrying an exact analytic or NURBS equation). We want a **feature program**
+H = (f₁, …, f_n), a sequence of sketch, pad, pocket, hole, fillet, chamfer and mirror operations
+with numeric parameters, such that executing H in a CAD kernel reproduces S:
+
+  Build(H) ≈ S, measured by volumetric IoU(Build(H), S) → 1.
+
+The inverse map S ↦ H is **many-to-one and non-unique**: many programs build the same solid. Any
+valid program is acceptable. We do not need the designer's original history, only *a* parametric
+one that rebuilds the solid.
+
+### O.2 Stage 1: reading the B-Rep (exact geometry, no learning)
+
+The STEP file is parsed by the kernel (OpenCASCADE) into a B-Rep. Every face has a surface equation:
+
+| surface | implicit form (what the kernel stores as parameters) |
+|---|---|
+| plane | n·x − d = 0 (normal n, offset d) |
+| cylinder | ‖(x − p) × a‖ − r = 0 (axis point p, direction a, radius r) |
+| cone | angle-based form with apex, axis and semi-angle α |
+| torus | (√(ρ²) − R)² + z² − r² = 0 in the torus frame (fillets on circular edges) |
+| sphere | ‖x − c‖ − r = 0 |
+| NURBS | rational tensor-product B-spline S(u, v) (free-form; Part I) |
+
+Two kinds of information are extracted from this:
+
+1. **Sampled geometry (for the neural network)**: each face is sampled on a 10 × 10 UV grid of
+   points, normals and an inside/outside trim mask (Part K). Each edge is sampled on a 10-point
+   U-grid. This is the UV-Net representation: it is uniform across surface types and is what the
+   CNN/GNN encoder consumes.
+2. **Exact analytic attributes and values (for precision)**: surface type, axis, radius, convexity
+   and area of each face, plus the dihedral angle and convexity of each edge. From the same equations
+   a **candidate set** C of exact numbers is built: vertex coordinates, circle centres and radii,
+   plane offsets, diameters, cone angles, bounding-box extents and pairwise coordinate differences.
+   Typically about 450 values per part. On the synthetic data, 98.9 % of all numbers in the true
+   history occur *exactly* in C.
+
+The key idea: **the dimensions of a design history are almost always readable from the equations of
+the final solid.** A pad length is a difference of two plane offsets, a hole diameter is twice a
+cylinder radius, and a sketch line endpoint is a vertex coordinate. A network that *selects* from C
+is exact by construction. A network that *regresses* numbers is approximate.
+
+### O.3 Stage 2: recovering what the solid no longer contains (analytic geometry)
+
+Some quantities the history needs are **not** present in the final solid. The main case is the edge
+a fillet or chamfer was applied to. Rounding a sharp edge deletes it and replaces it with a blend
+face. The history must still reference that edge.
+
+It is recovered with equations rather than learning:
+
+- A fillet face is tangent (G1, Part L) to its two **support faces**. A chamfer meets its two
+  supports at an angle. The supports are identified from the face adjacency and the normals along the
+  shared edges.
+- The deleted sharp edge is the **intersection curve of the two support surfaces**:
+  {x : F₁(x) = 0 and F₂(x) = 0}. This is computed analytically: plane ∩ plane gives a line,
+  plane ∩ cylinder gives a circle or ellipse, and so on.
+- A point of the blend face is projected onto that curve, which yields an exact point on the sharp
+  edge. This point is a **virtual edge**.
+
+Two clean-up results came out of this analysis:
+
+- About 21 % of the edge references in the synthetic histories pointed at **smooth edges**
+  (n₁·n₂ ≈ 1, a tangent join). Filleting such an edge is a geometric no-op, so it cannot be inferred
+  from the solid. These references were removed.
+- 94 % of the remaining references lie exactly on a recovered virtual edge.
+
+### O.4 Stage 3: the encoder (learning a representation of the solid)
+
+Face and edge samples are embedded by small CNNs (2-D convolution over the face UV-grid, 1-D over the
+edge grid; Part C). They are then propagated over the **face-adjacency graph** by message passing
+(Part D), so every face embedding knows its neighbourhood: is it the floor of a pocket, the wall of
+a counterbore, a blend between two walls?
+
+A Transformer encoder (Part E) then lets every face attend to every other face. The output is a
+set of face "memory" vectors plus one global vector. The exact analytic attributes from O.2 are
+concatenated to the inputs. An **auxiliary segmentation loss** trains the face vectors to predict
+which feature type created each face (feature identification, UV-Net/AAGNet style). This acts as a
+regulariser that makes the representation feature-aware.
+
+### O.5 Stage 4: the hybrid decoder (structure from tokens, numbers from equations)
+
+The design history is written as a token sequence (Part G), for example:
+
+  `SKETCH +Z 0 PROFILE LOOP LINE x₁ y₁ LINE … PAD EXT+ h FILLET r E_LINE x y z …`
+
+An autoregressive Transformer decoder (Part F) emits it one token at a time, with
+cross-attention to the face memory. Three output mechanisms are mixed:
+
+1. **Structure tokens** (operation type, axis, loop structure). These come from a softmax over a
+   small vocabulary and are masked by a **grammar** (a finite-state checker), so every output is a
+   syntactically valid program. The grammar also enforces simple inequalities, e.g. a counterbore
+   hole diameter must be smaller than its head diameter.
+2. **Number copy head (pointer-generator)**. Wherever a number is due, a gate g decides between
+   *copying* a candidate c ∈ C (from O.2) and *generating* digits on the 0.05 mm grid. The copy
+   distribution is an attention over embeddings of the candidates (value, origin tags, context).
+   Training maximises the marginal likelihood
+
+     p(value) = σ(g) · Σ_{c ∈ C, c = value} π(c) + (1 − σ(g)) · p_gen(value).
+
+   Several candidates may hold the same value, so all of them count as correct.
+3. **Edge pointer**. After a fillet/chamfer edge token, a second pointer selects one of the
+   **virtual edges** from O.3 and emits its exact x, y, z. The selection is a classification over a
+   small set of geometrically valid choices, not a regression of three coordinates.
+
+Decoding is either greedy or sampled. With **generate-and-verify**, N candidate histories are sampled
+and each is rebuilt by the kernel. The one with the highest IoU against the input is kept. This step
+is legitimate at inference because it uses only the input solid.
+
+### O.6 How the equations give precision
+
+A purely neural regressor is limited by its output resolution and by approximation error.
+Typically it is off by 0.1–2 mm, which breaks coincident faces and edge selections. In this
+pipeline:
+
+- **Numbers come from the input's own equations** (O.2), so a correct choice is exact to machine
+  precision, not "close".
+- **Edge references come from surface–surface intersections** (O.3), so a correct choice lies
+  exactly on the edge the kernel must find.
+- **The kernel is the verifier**. Rebuilding and measuring IoU and strict build success rejects
+  candidates whose choices are inconsistent.
+
+Measured effect on 1000 held-out parts (with generate-and-verify): the share of near-perfect rebuilds
+(IoU > 0.99) rose from 23 % (v1, digits only) to 60 % (copy head + edge pointer), and strict rebuilds
+from 16 % to 42 %.
+
+### O.7 Where GINN (geometry-informed neural networks) fits
+
+*Geometry-informed* learning, by analogy with physics-informed networks (PINNs), means putting
+**geometric equations and constraints into training or inference**, rather than learning only from
+input/output examples. There are three levels:
+
+| level | idea | status in solid2param |
+|---|---|---|
+| 1. Geometry-informed **inputs and outputs** | Feed exact equations and attributes. Restrict outputs to values and edges derived from the solid's equations (copy and edge pointers, analytic intersection, grammar inequalities). | **Implemented** (phases 2–3b). This is where the precision currently comes from. |
+| 2. **Equation-residual loss** | A differentiable PINN-style term. For a predicted feature, evaluate its implicit surface on the input's UV samples and penalise the residual, e.g. for a hole Σ (‖(x − p) × a‖ − r)² over the cylinder face's points. For a fillet, penalise the tangency mismatch 1 − n_fillet · n_support along the boundary. | **Planned**. Needs continuous parameter heads; the residual vanishes exactly for the true parameters. |
+| 3. **Constraint refinement / kernel rewards** | After decoding, solve a small least-squares problem min_θ Σ residual² to snap parameters to the input faces. Use non-differentiable kernel checks (build success, IoU, topology χ / genus, G1 continuity match) as rewards for reranking or RL fine-tuning. | **Partly implemented**: kernel verification and reranking (generate-and-verify). LSQ refinement and RL are planned. |
+
+Why levels 2–3 matter beyond synthetic data: on real parts some dimensions are not on any grid and
+not exactly present as a single candidate. Examples are sketch points constrained by tangency, or
+values produced by the designer's own formulas. There, the copy head cannot be exact, and an
+equation residual or least-squares fit against the input surfaces recovers the precision.
+
+Note on differentiability: topology (Euler characteristic, genus) and continuity *classes*
+(G0/G1/G2) are discrete. They cannot be used directly as gradient losses. They belong in level 3
+as checks and rewards. Smooth surrogates (normal-alignment and curvature-difference residuals) can
+be used in level 2.
+
+### O.8 The output: the design-history JSON
+
+The token sequence is decoded into a validated JSON document, checked against the schema in
+`cadseq/schema.py`. The example below is illustrative:
+
+```json
+{"features": [
+  {"id": "S1", "type": "sketch", "plane": {"origin": [0,0,0], "normal": [0,0,1], "x_dir": [1,0,0]},
+   "profiles": [{"outer": [{"type": "line", "start": [-61.05,-44.4], "end": [61.05,-44.4]}, "…"], "inner": []}]},
+  {"id": "P1", "type": "pad", "sketch": "S1", "length": 20.0, "direction": 1, "symmetric": false},
+  {"id": "H1", "type": "hole", "kind": "counterbore", "position": [30,0,20], "direction": [0,0,-1],
+   "diameter": 6.6, "cb_diameter": 11.0, "cb_depth": 6.5, "through_all": true},
+  {"id": "F1", "type": "fillet", "radius": 2.0,
+   "edges": [{"point": [61.05, 0.0, 20.0], "curve": "line"}]}
+]}
+```
+
+- Sketch geometry is expressed in the sketch plane's 2-D frame. Solid features reference sketches
+  by id.
+- **Edge references are geometric** (a point on the edge plus its curve type), not kernel-internal
+  names. This makes them portable across kernels and avoids the persistent-naming problem: any
+  kernel (CadQuery/OCC now, CATIA CAA later) resolves an edge by "nearest edge of this curve type
+  to this point".
+- The JSON saved by `predict.py` is the history that **strictly** rebuilds the output solid. If the
+  lenient builder had to snap an edge or drop a failing feature, the repaired history is what gets
+  saved.
+
+### O.9 Summary diagram
+
+```
+STEP ──► B-Rep (exact equations)
+          ├─ UV / U grids ───────────► CNN + GNN + Transformer encoder ──► face memory
+          ├─ analytic attributes ────►         (aux: per-face feature class)
+          ├─ candidate values C ─────► copy head  ─┐
+          └─ support-surface ∩ ──────► virtual edges ─► edge pointer ─┐
+                                                       │          │
+          grammar-constrained Transformer decoder ◄────┴──────────┘
+                    │  (structure tokens + copied numbers + pointed edges)
+                    ▼
+          N candidate histories ─► kernel rebuild ─► IoU vs input ─► best JSON
+                    (planned: equation-residual loss, LSQ refinement, RL with kernel rewards)
+```
+
+**Search topics:** pointer-generator networks; copy mechanism in sequence-to-sequence models;
+surface–surface intersection algorithms; implicit surface residuals; physics-informed neural
+networks; geometry-informed neural networks (GINN); persistent naming problem in CAD; program
+synthesis with execution-guided decoding.
+
+**Prompt for an LLM:** *"Explain how a pointer-generator network can copy exact numeric values from
+an input set instead of generating them, and how this applies to reverse-engineering CAD feature
+parameters from a B-Rep. Then explain how an equation-residual loss, in the style of
+physics-informed neural networks, could enforce that a predicted cylinder or fillet fits the sampled
+input surface, and why discrete properties such as topology and G1/G2 continuity class need
+reward-based rather than gradient-based treatment."*
+
+---
+
 ## Recommended study order
 
 1. **Part A** (maths), then **Part H** (B-Rep), then **Part I** (curves and surfaces), then **Part K** (UV space).
@@ -388,6 +601,7 @@ B-spline knot multiplicity", "curvature comb", "zebra stripe analysis", "reflect
    understand why rebuilds succeed or fail, and how the predicted history behaves in the CAD system.
 5. **Part N** (research landscape). After this you can place this system among published work
    and choose next steps.
+6. **Part O** (this project's pipeline). Read last: it ties every earlier part to a concrete stage.
 
 ## Core references (search by title)
 

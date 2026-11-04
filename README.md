@@ -57,7 +57,7 @@ STEP → B-Rep graph → encoder ─┼─ numbers: coarse token + continuous re
 | 0 | ⏳ | **Fix known v1 issues** (see below) | v1.1 baseline |
 | 1 | ✅ | **Provenance labels**: face → creating feature (class, role, instance, mirror) by replaying each history with OCC operation history (`cadseq/provenance.py`, `cadseq/labels.py`) — added to the existing 20K dataset without regeneration; plus exact analytic face / edge attributes (surface type, axis, radius, convexity) | 925K labelled faces |
 | 2 | ✅ | **Feature identification** (UV-Net / AAGNet-style face segmentation): `identify.py` colours each face of a STEP by feature class, groups faces into feature regions and reads parameters from the exact B-Rep — test: 99.8 % face accuracy, mIoU 0.995, instance F1 0.984, placement-invariant. (MFCAD++ benchmark still to do) | standalone tool + auxiliary task for phase 3 |
-| 3 | 🔶 | **Hybrid decoder**: ✅ copy head over exact input B-Rep values (pointer-generator), grammar value ranges, pose augmentation, aux segmentation — test (verified): IoU > 0.99 23 % → 58 %, median 0.978 → 0.994; ⏳ 3b edge-reference pointer to recovered sharp edges; equation-residual losses | v2 model |
+| 3 | ✅ | **Hybrid decoder**: copy head over exact input B-Rep values (pointer-generator), grammar value ranges, pose augmentation, aux segmentation, edge pointer to recovered sharp edges — test (verified): strict build 15.8 % → 42.4 %, IoU > 0.99 23 % → 60 %, median 0.978 → 0.994. Equation-residual losses deferred to phase 4 | v2 / v3 model |
 | 4 | ⏳ | **Inference**: least-squares refinement, N-sample generate-and-verify reranking; then RL fine-tuning with CAD-kernel rewards | precision + build-rate gains |
 | 5 | ⏳ | **A-surface solids**: NURBS head, G1/G2 continuity losses, freeform synthetic data | freeform reconstruction |
 | 6 | ⏳ | **CATIA rebuild** (was step 3): JSON → CATIA V5 R29 feature tree via CAA (COM automation prototype first) | parametric CATIA parts |
@@ -703,7 +703,7 @@ Two findings drive phase 3b:
    histories re-targeted to recovered points rebuild strictly with IoU 1.0. (OCC's
    `BRepAlgoAPI_Defeaturing` was tried first: up to 100 s per face and no usable history.)
 
-### Phase 3b — edge pointer (in progress)
+### Phase 3b — edge pointer (done)
 
 - `cadseq/edgefix.py`: prunes smooth refs, computes virtual edges for every face, links each ref to
   the virtual edges lying on its exact intermediate-body edge (a pointer *group*), moves the ref point
@@ -717,6 +717,20 @@ Two findings drive phase 3b:
   used edges are masked. Loss: `−log σ(g) − log Σ_group π_k` for refs with targets, `−log σ(−g)` otherwise.
 - Sanity check: 64 training parts memorised → pointer used for 91 % of generated edge refs, 98.4 %
   strict rebuilds, IoU 0.99996 (token-exact 91 %: the pointer may pick another point on the same edge).
+
+**Results — `runs/v3` (60 epochs), test split, 1000 parts:**
+
+| model / inference | exact | built (strict / lenient) | IoU mean | IoU median | > 0.9 | > 0.95 | > 0.99 |
+|---|---|---|---|---|---|---|---|
+| v2 greedy | 2.8 % | 15.4 % / 95.6 % | 0.909 | 0.987 | 85.5 % | 74.8 % | 44.3 % |
+| **v3 greedy** | 4.6 % | **32.7 %** / 95.8 % | 0.911 | 0.989 | 85.0 % | 74.7 % | 47.8 % |
+| v2 + generate-and-verify (8, T = 0.5) | 3.1 % | 19.5 % / 98.7 % | 0.960 | 0.994 | 93.8 % | 87.1 % | 58.0 % |
+| **v3 + generate-and-verify** (8, T = 0.5) | 5.8 % | **42.4 % / 99.5 %** | **0.966** | **0.994** | **94.2 %** | **88.1 %** | **60.0 %** |
+
+The edge pointer **more than doubles strict rebuilds** (the predicted history rebuilds exactly as written,
+no edge snapping or skipped features) and gives the best result on every metric. Teacher-forced edge-pick
+accuracy 84 % (v2: 64 %). `runs/v3/best.pt` is the current recommended checkpoint. Validation loss was still
+falling at epoch 60 — longer training is a cheap later gain.
 
 ```powershell
 .venv\Scripts\python.exe -m cadseq.edgefix data\synth_v2 --workers 8     # once
